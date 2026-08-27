@@ -1,6 +1,6 @@
 # CMake 빌드 폴더 무시
-build/
-.cache/
+./build
+./.cache
 out/
 bin/
 
