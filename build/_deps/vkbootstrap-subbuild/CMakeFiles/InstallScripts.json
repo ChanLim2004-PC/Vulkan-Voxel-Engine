@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/WorkingFile/Clang/Vulkan/voxel_engine/build/_deps/vkbootstrap-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

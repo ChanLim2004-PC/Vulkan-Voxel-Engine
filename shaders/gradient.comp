@@ -1,0 +1,33 @@
+//GLSL version to use
+#version 460
+//size of a workgroup for compute(총 256개의 thread가 있다)
+//이 팀들이 바둑판처럼 모여서 화면 전체의 픽셀을 나누어 맡아 동시에 그림을 그림
+layout (local_size_x = 16, local_size_y = 16) in;
+
+//유니폼 버퍼(이미지를 바인딩 한다.)
+layout(rgba16f,set = 0, binding = 0) uniform image2D image;
+
+void main() 
+{
+    //현제 스래드가 어디 픽샐을 보고 있는지
+    ivec2 texelCoord = ivec2(gl_GlobalInvocationID.xy);
+    //걍 사이즈
+    ivec2 size = imageSize(image);
+
+    //16배수가 아니면 그 이전 픽샐에 clamp하도록 하는거임
+    if(texelCoord.x < size.x && texelCoord.y < size.y)
+    {
+	//기본값 블랙
+        vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
+	//맨 윗줄 그리고 맨 옆줄은 그냥 black 이유는: x!=0, y!=0 스레드(0,0)은 그리지 못하도록 설정을 함
+        if(gl_LocalInvocationID.x != 0 && gl_LocalInvocationID.y != 0)
+        {
+	    //나머지는 그냥 그리기
+            color.x = float(texelCoord.x)/(size.x);
+            color.y = float(texelCoord.y)/(size.y);	
+        }
+    
+	//이미지를 저장을 한다
+        imageStore(image, texelCoord, color);
+    }
+}

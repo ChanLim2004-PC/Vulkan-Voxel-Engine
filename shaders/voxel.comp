@@ -1,0 +1,347 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+struct Vertex {
+    vec3 position;
+    float uv_x;
+    vec3 normal;
+    float uv_y;
+    vec4 color;
+};
+
+struct DrawIndexedIndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+struct AccelerationStructureBuildRangeInfo {
+    uint primitiveCount;  
+    uint primitiveOffset; 
+    uint firstVertex;
+    uint transformOffset;
+};
+
+struct MCData {
+    ivec4 triRows[4];
+};
+
+struct GRIDCELL {
+    vec3 p[8];
+    float val[8];
+};
+
+struct TRIANGLE {
+    vec3 position[3];
+    float indicies[3];
+    vec4 color[3];
+};
+
+struct SingleVoxel {
+    TRIANGLE triangle[5];
+    uint ntriang;
+};
+struct TerrainColor{
+    float height;
+    vec4 color;
+};
+
+layout(buffer_reference, std430) buffer VertexBufferRef {
+    Vertex vertices[];
+};
+
+layout(buffer_reference, std430) buffer IndexBufferRef {
+    uint indices[];
+};
+
+layout(buffer_reference, std430) buffer CounterBufferRef {
+    uint totalAllocatedVertices;
+};
+
+layout(buffer_reference, std430) buffer IndirectCommandRef {
+    DrawIndexedIndirectCommand commands[];
+};
+
+layout(buffer_reference, std430) buffer IndirectRangeBufferRef {
+    AccelerationStructureBuildRangeInfo accstruct;
+};
+
+layout(std140, set = 0, binding = 0) uniform MCUniformBuffer {
+    ivec4 edgeTable[64];
+    MCData triTable[256];
+} u_mcTables;
+
+layout(push_constant) uniform PushConstants {
+    VertexBufferRef outputVertexBuffer;
+    IndexBufferRef  outputIndexBuffer;  
+    IndirectCommandRef indirectCmdBuffer;
+    CounterBufferRef global_offset;             
+    IndirectRangeBufferRef rangeBuffer;
+    uint  indirectBufferNum;      
+    vec4 inputStartPosition; 
+} push;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+shared uint groupTriangleCount; 
+shared uint groupGlobalBaseIndex;
+
+int getTriTableValue(uint cubeIndex, int i) {
+    int row = i / 4;
+    int col = i % 4;
+    return u_mcTables.triTable[cubeIndex].triRows[row][col];
+}
+
+int getEdgeFlags(uint cubeIndex) {
+    int row = int(cubeIndex) / 4;
+    int col = int(cubeIndex) % 4;
+    return u_mcTables.edgeTable[row][col];
+}
+
+vec2 randomGradiantVector(vec2 gridEdge) {
+    gridEdge += 0.01;
+    float randomVectorX = dot(gridEdge, vec2(123.4, 234.5));
+    float randomVectorY = dot(gridEdge, vec2(234.5, 345.6));
+    vec2 gradient = vec2(randomVectorX, randomVectorY);
+    gradient = sin(gradient);
+    return gradient;
+}
+
+float perlin_noise(float noiseX, float noiseZ) {
+    vec2 amoutOfChunk = vec2(noiseX, noiseZ);
+    vec2 gridID = floor(amoutOfChunk);
+    vec2 gridSpecification = fract(amoutOfChunk);
+
+    vec2 bottomLeft = gridID + vec2(0.0f, 0.0f);
+    vec2 bottomRight = gridID + vec2(1.0f, 0.0f);
+    vec2 topLeft = gridID + vec2(0.0f, 1.0f);
+    vec2 topRight = gridID + vec2(1.0f, 1.0f);
+
+    vec2 randomGradientBottomLeft = randomGradiantVector(bottomLeft);
+    vec2 randomGradientBottomRight = randomGradiantVector(bottomRight);
+    vec2 randomGradientTopLeft = randomGradiantVector(topLeft);
+    vec2 randomGradientTopRight = randomGradiantVector(topRight);
+
+    vec2 distanceFromPixelBottomLeft = gridSpecification - vec2(0.0f, 0.0f);
+    vec2 distanceFromPixelBottomRight = gridSpecification - vec2(1.0f, 0.0f);
+    vec2 distanceFromPixelTopLeft = gridSpecification - vec2(0.0f, 1.0f);
+    vec2 distanceFromPixelTopRight = gridSpecification - vec2(1.0f, 1.0f);
+
+    float dotBottomLeft = dot(randomGradientBottomLeft, distanceFromPixelBottomLeft);
+    float dotBottomRight = dot(randomGradientBottomRight, distanceFromPixelBottomRight);
+    float dotTopLeft = dot(randomGradientTopLeft, distanceFromPixelTopLeft);
+    float dotTopRight = dot(randomGradientTopRight, distanceFromPixelTopRight);
+
+    vec2 f = gridSpecification * gridSpecification * (vec2(3.0f) - vec2(2.0f) * gridSpecification);
+
+    float bottom = mix(dotBottomLeft, dotBottomRight, f.x);
+    float top    = mix(dotTopLeft,    dotTopRight,    f.x);
+    float perlin = mix(bottom, top, f.y);
+    return perlin;
+}
+
+vec3 VertexInterp(float isolevel, vec3 p1, vec3 p2, float valp1, float valp2) {
+    if (abs(isolevel - valp1) < 0.00001) return p1;
+    if (abs(isolevel - valp2) < 0.00001) return p2;
+    float denominator = valp2 - valp1;
+    if (abs(denominator) < 0.00001) {
+        return (p1 + p2) * 0.5f;
+    }
+    float mu = float((isolevel - valp1) / denominator);
+    return mix(p1, p2, mu);
+}
+
+SingleVoxel marching_cube_calculation(GRIDCELL grid, vec4 color) {
+    uint cubeindex = 0;
+    uint ntriang = 0;
+    vec3 vertlist[12];
+    float isolevel = 0.0;
+    uint edgeFlags;
+
+    TRIANGLE triangles[5];
+
+    for(int i = 0; i < 8; i++) {
+        if (grid.val[i] < isolevel) {
+            cubeindex |= (1u << i);
+        }
+    }
+    edgeFlags = getEdgeFlags(cubeindex);
+
+    if (edgeFlags == 0)
+        return SingleVoxel(triangles, 0u);
+
+    if ((edgeFlags & 1u) != 0u)    vertlist[0] = VertexInterp(isolevel, grid.p[0], grid.p[1], grid.val[0], grid.val[1]);
+    if ((edgeFlags & 2u) != 0u)    vertlist[1] = VertexInterp(isolevel, grid.p[1], grid.p[2], grid.val[1], grid.val[2]);
+    if ((edgeFlags & 4u) != 0u)    vertlist[2] = VertexInterp(isolevel, grid.p[2], grid.p[3], grid.val[2], grid.val[3]);
+    if ((edgeFlags & 8u) != 0u)    vertlist[3] = VertexInterp(isolevel, grid.p[3], grid.p[0], grid.val[3], grid.val[0]);
+    if ((edgeFlags & 16u) != 0u)   vertlist[4] = VertexInterp(isolevel, grid.p[4], grid.p[5], grid.val[4], grid.val[5]);
+    if ((edgeFlags & 32u) != 0u)   vertlist[5] = VertexInterp(isolevel, grid.p[5], grid.p[6], grid.val[5], grid.val[6]);
+    if ((edgeFlags & 64u) != 0u)   vertlist[6] = VertexInterp(isolevel, grid.p[6], grid.p[7], grid.val[6], grid.val[7]);
+    if ((edgeFlags & 128u) != 0u)  vertlist[7] = VertexInterp(isolevel, grid.p[7], grid.p[4], grid.val[7], grid.val[4]);
+    if ((edgeFlags & 256u) != 0u)  vertlist[8] = VertexInterp(isolevel, grid.p[0], grid.p[4], grid.val[0], grid.val[4]);
+    if ((edgeFlags & 512u) != 0u)  vertlist[9] = VertexInterp(isolevel, grid.p[1], grid.p[5], grid.val[1], grid.val[5]);
+    if ((edgeFlags & 1024u) != 0u) vertlist[10] = VertexInterp(isolevel, grid.p[2], grid.p[6], grid.val[2], grid.val[6]);
+    if ((edgeFlags & 2048u) != 0u) vertlist[11] = VertexInterp(isolevel, grid.p[3], grid.p[7], grid.val[3], grid.val[7]);
+
+    for (int i = 0; getTriTableValue(cubeindex, i) != -1; i += 3) {
+        triangles[ntriang].position[0] = vertlist[getTriTableValue(cubeindex, i)];
+        triangles[ntriang].position[1] = vertlist[getTriTableValue(cubeindex, i+1)];
+        triangles[ntriang].position[2] = vertlist[getTriTableValue(cubeindex, i+2)];
+
+	triangles[ntriang].color[0] = color;
+	triangles[ntriang].color[1] = color;
+	triangles[ntriang].color[2] = color;
+
+        triangles[ntriang].indicies[0] = i;
+        triangles[ntriang].indicies[1] = i + 1;
+        triangles[ntriang].indicies[2] = i + 2;
+        ntriang += 1u;
+    }
+
+    return SingleVoxel(triangles, ntriang);
+}
+vec4 texture_implementaion(uint octave, float amplitude, float persistence, float current_height){
+    TerrainColor region[4];
+    region[0].color = vec4(0.0, 0.7, 0.0, 1.0);
+    region[0].height = 0.5;
+
+    region[1].color = vec4(0.0, 0.5, 0.0, 1.0);
+    region[1].height = 0.56;
+
+    region[2].color = vec4(0.5, 0.5, 0.5, 1.0);
+    region[2].height = 0.595;
+
+    region[3].color = vec4(1.0, 1.0, 1.0, 1.0);
+    region[3].height = 1.0;
+
+    // GLSL 등비수열 표현--> 이러면 총 크기를 알 수 있음 -155~155까지 일거임
+    float max_noise_val = amplitude * (1.0f - pow(persistence, float(octave))) / (1.0f - persistence);
+    //total_noise(terrain의 현제 위치)/max_noise_val(terrain 최대 위치)
+    //여기서 이미 0.0 ~ 1.0이 정해짐
+    float normalized_noise = (current_height / max_noise_val) * 0.5f + 0.5f;
+    //normalized_noise = clamp(normalized_noise, 0.0f, 1.0f);
+    for(int i = 0; i < region.length(); i++){
+	if(normalized_noise <= region[i].height){
+	    return region[i].color;
+	}
+    }
+}
+SingleVoxel evaluate_voxel(vec3 starting_point, vec3 id) {
+    uint GRID_RES = 32u;
+    float BLOCK_SIZE = 32.0f;
+    float STEP = BLOCK_SIZE / float(GRID_RES);
+    
+    vec3 UNIT_CUBE_OFFSETS[8] = {
+        {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f},
+        {1.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 1.0f},
+        {0.0f, 1.0f, 0.0f}, {1.0f, 1.0f, 0.0f},
+        {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f, 1.0f}
+    };
+
+    float amplitude = 300.0f; 
+    float frequency = 0.005f; 
+    float persistence = 0.5f;
+    float lacunarity = 2.0f; 
+    uint octave = 7;
+
+    vec3 cellMinPos = starting_point + vec3(id.x * STEP, id.y * STEP, id.z * STEP);
+
+    GRIDCELL gridcell;
+    vec4 color;
+    for(int i = 0; i < 8; i++) {
+        gridcell.p[i] = cellMinPos + (UNIT_CUBE_OFFSETS[i] * STEP);
+        vec3 pos = gridcell.p[i];
+        float total_noise = 0.0;
+        float current_amp = amplitude;
+        float current_freq = frequency;
+	//전체 크기를 줌 아마 amplitude가 80이고 ocatve가 5면 -155~155의 크기를 총 줄거임
+        for (int j = 0; j < octave; j++) {
+            float surface = perlin_noise(pos.x * current_freq, pos.z * current_freq);
+	    //j = 0이면 대충 amplitude 가 80이라고 하면 크기는 noise에 따라서 크기를 줄것이다.
+            total_noise += surface * current_amp;
+            current_amp *= persistence;
+            current_freq *= lacunarity;
+        }
+	if(i == 0){
+	    //color = texture_implementaion(octave, amplitude, persistence, total_noise);
+	}
+        gridcell.val[i] = total_noise - pos.y;
+    }
+    return marching_cube_calculation(gridcell, color);
+}
+
+void main() {
+    uvec3 local_id = gl_LocalInvocationID;
+    uvec3 group_id = gl_WorkGroupID;
+
+    if (gl_LocalInvocationIndex == 0u) {
+        groupTriangleCount = 0u;
+    }
+    barrier(); 
+
+    float CHUNK_SIZE = 32.0f;
+    vec3 starting_point = (vec3(group_id) * CHUNK_SIZE) + push.inputStartPosition.xyz;
+
+    SingleVoxel voxels[64];
+    uint localTriIndices[64];
+    uint threadTotalIndices = 0u;
+
+    uint voxelIdx = 0u;
+    for (uint x = 0u; x < 4u; x++) {
+        for (uint y = 0u; y < 4u; y++) {
+            for (uint z = 0u; z < 4u; z++) {
+                uvec3 voxel_id = (local_id * 4u) + uvec3(x, y, z);
+                //this contains the number of triangles and the triangles vertcies
+                voxels[voxelIdx] = evaluate_voxel(starting_point, vec3(voxel_id));
+                uint numIdx = voxels[voxelIdx].ntriang * 3u;
+                //number of triangles vertcies in each voxel
+                localTriIndices[voxelIdx] = numIdx;
+		//number of triangles vertcies in total
+                threadTotalIndices += numIdx;
+                voxelIdx++;
+            }
+        }
+    }
+
+    uint myLocalOffset = 0u;
+    if (threadTotalIndices > 0u) {
+        myLocalOffset = atomicAdd(groupTriangleCount, threadTotalIndices);
+    }
+
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && groupTriangleCount > 0u) {
+        uint current_Index = push.indirectBufferNum;
+	//이전 workgroup에 총 indexCount를 가지고 옴(오로지 batch 총 index만 가지고 있음)
+        uint prevIndexCount = atomicAdd(push.indirectCmdBuffer.commands[current_Index].indexCount, groupTriangleCount);
+	//이전 workgroup에 총 indexCount를 가지고 옴(전체 terrain index를 가지고 옴)
+        groupGlobalBaseIndex = atomicAdd(push.global_offset.totalAllocatedVertices, groupTriangleCount);
+	//만약 이전 workgroup의 index가 0이면 이제 새로운 batch이므로 그냥 firstIndex에다가 우리 총 terrainIndex를 넣어줌
+	if (prevIndexCount == 0u) {
+            push.indirectCmdBuffer.commands[current_Index].firstIndex = groupGlobalBaseIndex;
+        }
+    }
+
+    barrier(); 
+    if (threadTotalIndices > 0u) {
+        uint vertexWriteIdx = groupGlobalBaseIndex + myLocalOffset;
+	uint myTriangleCount = threadTotalIndices / 3u;
+
+        for (uint v = 0u; v < 64u; v++) {
+            if (voxels[v].ntriang > 0u) {
+                for (uint i = 0u; i < voxels[v].ntriang; i++) {
+                    push.outputVertexBuffer.vertices[vertexWriteIdx + 0u].position = voxels[v].triangle[i].position[0];
+                    push.outputVertexBuffer.vertices[vertexWriteIdx + 1u].position = voxels[v].triangle[i].position[1];
+                    push.outputVertexBuffer.vertices[vertexWriteIdx + 2u].position = voxels[v].triangle[i].position[2];
+
+                    push.outputIndexBuffer.indices[vertexWriteIdx + 0u] = vertexWriteIdx + 0u;
+                    push.outputIndexBuffer.indices[vertexWriteIdx + 1u] = vertexWriteIdx + 1u;
+                    push.outputIndexBuffer.indices[vertexWriteIdx + 2u] = vertexWriteIdx + 2u;
+                    vertexWriteIdx += 3u;
+                }
+            }
+        }
+	atomicAdd(push.rangeBuffer.accstruct.primitiveCount, myTriangleCount);
+    }
+}

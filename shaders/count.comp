@@ -1,0 +1,10 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+layout(buffer_reference, std430) buffer CounterVertexBufferRef {
+    Count count[];
+};
+
+layout(push_constant) uniform PushConstants {
+    CountVertexBufferRef vertex_count;
+} push;

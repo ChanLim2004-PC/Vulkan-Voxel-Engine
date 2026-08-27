@@ -1,0 +1,101 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+struct Vertex {
+    vec3 position;
+    float uv_x;
+    vec3 normal;
+    float uv_y;
+    vec4 color;
+};
+
+struct VoxelObject{
+    vec3 center;
+    float radius;
+    vec4 sphereBounds;
+};
+
+struct DrawIndexedIndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+layout(buffer_reference, std430) buffer BatchOffsetRef {
+    vec4 offsets[];
+};
+
+layout(buffer_reference, std430) buffer IndirectCommandRef {
+    DrawIndexedIndirectCommand commands[]; 
+};
+
+layout(buffer_reference, std430) buffer DrawCountBufferRef {
+    uint drawcount;
+};
+
+layout(push_constant) uniform PushConstants {
+    IndirectCommandRef finalIndirectCmdBuffer;
+    IndirectCommandRef indirectCmdBuffer;
+    BatchOffsetRef batchOffsetBuffer;
+    DrawCountBufferRef drawCounterBuffer;
+    vec4 inputStartPosition; 
+    uint batch_index;
+} push;
+
+layout(std140, set = 0, binding = 0) uniform cullUniformBuffer {
+    mat4 view;              
+    vec4 frustum;            
+    float znear, zfar;           
+    uint drawCount;          
+    int cullingEnabled;      
+    int occlusionEnabled;    
+    int lodEnabled;         
+    float pyramidWidth;          
+    float pyramidHeight;        
+}cullData;
+
+VoxelObject voxelObjectData(uint gID){
+    VoxelObject voxelObject;
+    //use this for now(this is going inisde UBO)
+    float chunk_size = 32.0f;
+    int batch_index = 2;
+
+    float batch_size = chunk_size * batch_index;
+    voxelObject.center = push.batchOffsetBuffer.offsets[gID].xyz + vec3(batch_size/2);
+    voxelObject.radius = distance(push.batchOffsetBuffer.offsets[gID].xyz, voxelObject.center);
+    voxelObject.sphereBounds = vec4(voxelObject.center, voxelObject.radius);
+
+    return voxelObject;
+}
+bool IsVisible(uint gID){
+    VoxelObject voxelObject = voxelObjectData(gID);
+    vec3 center = (cullData.view * vec4(voxelObject.center, 1.f)).xyz;
+    float radius = voxelObject.radius;
+    center.z = -center.z;
+    bool visible = true;
+
+    visible = visible && (center.z * cullData.frustum.y - abs(center.x) * cullData.frustum.x > -radius);
+    visible = visible && (center.z * cullData.frustum.w - abs(center.y) * cullData.frustum.z > -radius);
+    visible = visible && center.z + radius > cullData.znear && center.z - radius < cullData.zfar;
+
+    visible = visible || (cullData.cullingEnabled == 0);
+
+    return visible;
+}
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main(){
+    uint gID = gl_GlobalInvocationID.x;
+    if(gID < cullData.drawCount)
+    {
+	if (IsVisible(gID)) {
+	    uint targetIndex = atomicAdd(push.drawCounterBuffer.drawcount, 1);
+	    DrawIndexedIndirectCommand cmd = push.indirectCmdBuffer.commands[gID];
+	    cmd.instanceCount = 1;
+	    push.finalIndirectCmdBuffer.commands[targetIndex] = cmd;
+	}
+    }
+}

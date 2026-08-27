@@ -1,0 +1,16 @@
+# CMake 빌드 폴더 무시
+build/
+.cache/
+out/
+bin/
+
+# 실행 파일 무시
+*.exe
+*.out
+*.app
+
+# OS 자동 생성 파일 무시
+.DS_Store
+Thumbs.db
+
+.cache/
