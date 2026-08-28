@@ -1,0 +1,209 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+struct DrawIndexedIndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+/*struct ASBuildRangeInfo {
+    uint primitiveCount;   
+    uint primitiveOffset; 
+    uint firstVertex;      
+    uint transformOffset;
+};*/
+
+//이것은 아마 나중에 UBO처리 할 가능성이 높음
+struct PerlinNoiseData {
+    float amplitude;
+    float frequency;
+    float persistence;
+    float lacunarity;
+    uint  octave;
+};
+const PerlinNoiseData noiseData = PerlinNoiseData(300.0f, 0.005f, 0.5f, 2.0f, 7u);
+
+struct ChunkMetadata {
+    DrawIndexedIndirectCommand drawCmd;    
+    //일단은 여기는 봉인을 해둔다(RAYTRACING 단계에서 activate)
+    //ASBuildRangeInfo blasRange;  
+    vec4 aabbMin;
+    vec4 aabbMax;
+    uint chunkID;
+    //1은 dirty, 0은 air
+    uint flags;      
+};
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout(buffer_reference, std430) buffer ChunkCountBufferRef {
+    //청크별 정점을 새는 코드
+    ChunkMetadata chunkData[]; 
+};
+
+struct MCData { ivec4 triRows[4]; };
+
+//기존 UBO그대로 일단은 가지고 오삼
+layout(std140, set = 0, binding = 0) uniform MCUniformBuffer {
+    ivec4  edgeTable[64];
+    MCData triTable[256];
+} u_mcTables;
+
+layout(push_constant) uniform PushConstants {
+    ChunkCountBufferRef chunkCountBuffer;
+    //우리 전체 시작 index
+    vec4 inputStartPosition;
+    //dispatch에 시작점
+    uvec4 chunkGridDim;
+} push;
+
+shared uint groupVertexCount;
+
+// 노이즈 함수 동일 유지 (생략: perlin_noise)
+
+//기존 edgeTable에서 edge정보 가지고 오기
+int getEdgeFlags(uint cubeIndex) {
+    return u_mcTables.edgeTable[int(cubeIndex) / 4][int(cubeIndex) % 4];
+}
+
+//노이즈를 위한 평범한 서형 보간법
+vec2 randomGradiantVector(vec2 gridEdge) {
+    gridEdge += 0.01;
+    float randomVectorX = dot(gridEdge, vec2(123.4, 234.5));
+    float randomVectorY = dot(gridEdge, vec2(234.5, 345.6));
+    vec2 gradient = vec2(randomVectorX, randomVectorY);
+    gradient = sin(gradient);
+    return gradient;
+}
+//노이즈 함수
+
+float perlin_noise(float noiseX, float noiseZ) {
+    vec2 amoutOfChunk = vec2(noiseX, noiseZ);
+    vec2 gridID = floor(amoutOfChunk);
+    vec2 gridSpecification = fract(amoutOfChunk);
+
+    vec2 bottomLeft = gridID + vec2(0.0f, 0.0f);
+    vec2 bottomRight = gridID + vec2(1.0f, 0.0f);
+    vec2 topLeft = gridID + vec2(0.0f, 1.0f);
+    vec2 topRight = gridID + vec2(1.0f, 1.0f);
+
+    vec2 randomGradientBottomLeft = randomGradiantVector(bottomLeft);
+    vec2 randomGradientBottomRight = randomGradiantVector(bottomRight);
+    vec2 randomGradientTopLeft = randomGradiantVector(topLeft);
+    vec2 randomGradientTopRight = randomGradiantVector(topRight);
+
+    vec2 distanceFromPixelBottomLeft = gridSpecification - vec2(0.0f, 0.0f);
+    vec2 distanceFromPixelBottomRight = gridSpecification - vec2(1.0f, 0.0f);
+    vec2 distanceFromPixelTopLeft = gridSpecification - vec2(0.0f, 1.0f);
+    vec2 distanceFromPixelTopRight = gridSpecification - vec2(1.0f, 1.0f);
+
+    float dotBottomLeft = dot(randomGradientBottomLeft, distanceFromPixelBottomLeft);
+    float dotBottomRight = dot(randomGradientBottomRight, distanceFromPixelBottomRight);
+    float dotTopLeft = dot(randomGradientTopLeft, distanceFromPixelTopLeft);
+    float dotTopRight = dot(randomGradientTopRight, distanceFromPixelTopRight);
+
+    vec2 f = gridSpecification * gridSpecification * (vec2(3.0f) - vec2(2.0f) * gridSpecification);
+
+    float bottom = mix(dotBottomLeft, dotBottomRight, f.x);
+    float top    = mix(dotTopLeft,    dotTopRight,    f.x);
+    float perlin = mix(bottom, top, f.y);
+    return perlin;
+}
+
+//그냥 하나의 voxel안에 triangle이 몇게인지.(최종 ㅇㅋ??)
+int getTriCount(uint cubeIndex) {
+    int count = 0;
+    for (int i = 0; i < 16; i += 3) {
+        if (u_mcTables.triTable[cubeIndex].triRows[i / 4][i % 4] == -1) break;
+        count += 3; 
+    }
+    return count;
+}
+
+uint count_voxel(vec3 starting_point, vec3 id) {
+    float STEP = 1.0f; // 32.0f / 32.0f
+    //여기서 우리 진짜 voxel 위치를 찾는 것이다 single chunk기준으로
+    vec3 cellMinPos = starting_point + (id * STEP);
+    
+    vec3 UNIT_CUBE_OFFSETS[8] = {
+        {0,0,0}, {1,0,0}, {1,0,1}, {0,0,1},
+        {0,1,0}, {1,1,0}, {1,1,1}, {0,1,1}
+    };
+
+    uint cubeindex = 0u;
+    for(int i = 0; i < 8; i++) {
+	//voxel하나의 각각의 꼭지점 위치
+        vec3 pos = cellMinPos + (UNIT_CUBE_OFFSETS[i] * STEP);
+	//total_noise --> 지형의 진짜 크기
+        float total_noise = 0.0;
+        float current_amp = noiseData.amplitude;
+        float current_freq = noiseData.frequency;
+	for(int j = 0; j < noiseData.octave; j++){
+	    float surface = perlin_noise(pos.x * current_freq, pos.z * current_freq);
+	    total_noise += surface * current_amp;
+	    current_amp *= noiseData.persistence;
+	    current_freq *= noiseData.lacunarity;
+	}
+	//만약
+	//total_noise - pos.y < 0.0 이면 고체 반대면 공기
+	//기체이면 다 걸러네겠다는 포부
+        if ((total_noise - pos.y) < 0.0) {
+	    //만약 땅속이면 일단은 계산을 하고 본다
+	    //edgeTable에서 어짜피 땅속인게 다 걸러짐
+            cubeindex |= (1u << i);
+        }
+    }
+    if (getEdgeFlags(cubeindex) == 0) return 0u;
+    //아무튼 딱 vertexCount만 계산을 함 그래서 voxel하나의 trianle반환
+    return uint(getTriCount(cubeindex));
+}
+
+void main() {
+    uvec3 local_id = gl_LocalInvocationID;
+    if (gl_LocalInvocationIndex == 0u) {
+	//local_id 가 8*8*8 정도 되는데 
+	//거기서 local_id 딱 하나만 일단 groupVertexCount = 0으로 둠
+        groupVertexCount = 0u;
+    }
+    barrier();
+
+    //chunk의 시작점 전체적인 좌표료 봤을때
+    vec3 starting_point = (vec3(gl_WorkGroupID) * 32.0f) + push.inputStartPosition.xyz;
+    uint threadTotalVertices = 0u;
+
+    for (uint x = 0u; x < 4u; x++) {
+        for (uint y = 0u; y < 4u; y++) {
+            for (uint z = 0u; z < 4u; z++) {
+                uvec3 voxel_id = (local_id * 4u) + uvec3(x, y, z);
+		//이제 각각의 chunk total count가 여기에 모두 들어있음 ㅇㅇ.
+                threadTotalVertices += count_voxel(starting_point, vec3(voxel_id));
+            }
+        }
+    }
+
+    //여기에서 이제 groupVertexCount에다가 다 넣음 그러면 chunk하나 vertcies count가 완서이 될꺼다
+    if (threadTotalVertices > 0u) {
+        atomicAdd(groupVertexCount, threadTotalVertices);
+    }
+    //atomicAdd를 하는 상황이거나 shared variable을 만질때는 왠만하면 배리어가 좋음
+    barrier();
+
+    if (gl_LocalInvocationIndex == 0u) {
+	uint chunkID = gl_WorkGroupID.x + gl_WorkGroupID.y * push.chunkGridDim.x + gl_WorkGroupID.z * (push.chunkGridDim.x * push.chunkGridDim.y);
+	//이제 각각 chunkID에다가 다 넣음
+	//여기는 indirectDraw fillin
+        push.chunkCountBuffer.chunkData[chunkID].drawCmd.indexCount = groupVertexCount;
+	push.chunkCountBuffer.chunkData[chunkID].drawCmd.instanceCount = (groupVertexCount > 0u) ? 1u : 0u;
+	push.chunkCountBuffer.chunkData[chunkID].drawCmd.vertexOffset  = 0;
+	push.chunkCountBuffer.chunkData[chunkID].drawCmd.firstInstance = 0u;
+
+	//여기는 나머지 chunkData 부수적인 데이터들 fill in
+	push.chunkCountBuffer.chunkData[chunkID].chunkID = chunkID;
+	push.chunkCountBuffer.chunkData[chunkID].aabbMin = vec4(starting_point, 1.0f);
+	push.chunkCountBuffer.chunkData[chunkID].aabbMax = vec4(starting_point + 32.0f, 1.0f);
+	push.chunkCountBuffer.chunkData[chunkID].flags = (groupVertexCount > 0u) ? 1u : 0u;;
+    }
+}

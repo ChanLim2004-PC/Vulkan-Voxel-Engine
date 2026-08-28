@@ -1,0 +1,89 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+
+struct DrawIndexedIndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+//이거는 아직은 안쓸거임(RAYTRACING 할때 쓸것이다)
+struct AccelerationStructureBuildRangeInfo {
+    uint primitiveCount;
+    uint primitiveOffset;
+    uint firstVertex;
+    uint transformOffset;
+};
+
+layout(buffer_reference, std430) readonly buffer ChunkCountBufferRef {
+    //청크별 정점 숫자
+    uint chunkVertCounts[];
+};
+
+layout(buffer_reference, std430) buffer ChunkOffsetBufferRef {
+    //각각 청크에 시작점
+    uint chunkOffsets[];
+};
+
+layout(buffer_reference, std430) buffer IndirectCommandRef {
+    DrawIndexedIndirectCommand commands[];
+};
+//봉인
+layout(buffer_reference, std430) buffer IndirectRangeBufferRef {
+    AccelerationStructureBuildRangeInfo ranges[];
+};
+
+layout(push_constant) uniform PushConstants {
+    ChunkCountBufferRef    chunkCountBuffer;
+    ChunkOffsetBufferRef   chunkOffsetBuffer;
+    IndirectCommandRef     indirectCmdBuffer;
+    IndirectRangeBufferRef rangeBuffer;
+    //이번 프레임에 계산할 청크 총개수
+    uint                   numDirtyChunks;
+} push;
+
+// 공유 메모리(1024개를 쓸거임)
+// 이거 edit혹은 값을 꺼낼때마다 필요하다 barrier
+shared uint temp[1024];
+
+void main() {
+    //현제 쓰레드 (오로지 현제 Dispatch기준)
+    uint tid = gl_LocalInvocationIndex;
+    uint count = (tid < push.numDirtyChunks) ? push.chunkCountBuffer.chunkVertCounts[tid] : 0u;
+
+    //일단 가지고 온 각 청크 Vertex Count에 우리가 원하는 
+    temp[tid] = count;
+    //일단 temp 배열에 모든 count가 들어갈때까지 대기
+    barrier();
+
+    for (uint offset = 1u; offset < 1024u; offset <<= 1u) {
+        uint val = 0u;
+        if (tid >= offset) {
+            val = temp[tid - offset];
+	    barrier();
+        }
+        temp[tid] += val;
+        barrier();
+    }
+
+    if (tid >= push.numDirtyChunks) return;
+    uint startOffset = temp[tid] - count;
+    //뺸 데이터가 각각 시작점이다
+    push.chunkOffsetBuffer.chunkOffsets[tid] = startOffset;
+
+    push.indirectCmdBuffer.commands[tid].indexCount    = count;
+    //간단하다 만약 count가 있으면 1 아니면 0
+    push.indirectCmdBuffer.commands[tid].instanceCount = (count > 0u) ? 1u : 0u; 
+    push.indirectCmdBuffer.commands[tid].firstIndex    = startOffset;
+    push.indirectCmdBuffer.commands[tid].vertexOffset  = 0;
+    push.indirectCmdBuffer.commands[tid].firstInstance = 0u;
+
+    //이것은 아직 안쓰니 봉인을 해둔다
+    /*push.rangeBuffer.ranges[tid].primitiveCount  = count / 3u;
+    push.rangeBuffer.ranges[tid].primitiveOffset = startOffset * 4u; 
+    push.rangeBuffer.ranges[tid].firstVertex     = 0u;
+    push.rangeBuffer.ranges[tid].transformOffset = 0u;*/
+}

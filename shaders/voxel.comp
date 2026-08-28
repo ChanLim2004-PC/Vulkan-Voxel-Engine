@@ -17,36 +17,38 @@ struct DrawIndexedIndirectCommand {
     uint firstInstance;
 };
 
-struct AccelerationStructureBuildRangeInfo {
+//this is going to be used later
+/*struct AccelerationStructureBuildRangeInfo {
     uint primitiveCount;  
     uint primitiveOffset; 
     uint firstVertex;
     uint transformOffset;
+};*/
+
+struct PerlinNoiseData {
+    float amplitude;
+    float frequency;
+    float persistence;
+    float lacunarity;
+    uint  octave;
+};
+const PerlinNoiseData noiseData = PerlinNoiseData(300.0f, 0.005f, 0.5f, 2.0f, 7u);
+
+struct ChunkMetadata {
+    vec4 aabbMin;
+    vec4 aabbMax;
+    DrawIndexedIndirectCommand drawCmd;    
+    ASBuildRangeInfo blasRange;  
+    uint chunkID;
+    uint flags;      
+    uint _pad[2];
 };
 
-struct MCData {
-    ivec4 triRows[4];
-};
 
-struct GRIDCELL {
-    vec3 p[8];
-    float val[8];
-};
-
-struct TRIANGLE {
-    vec3 position[3];
-    float indicies[3];
-    vec4 color[3];
-};
-
-struct SingleVoxel {
-    TRIANGLE triangle[5];
-    uint ntriang;
-};
-struct TerrainColor{
-    float height;
-    vec4 color;
-};
+struct MCData { ivec4 triRows[4]; };
+struct GRIDCELL { vec3 p[8]; float val[8]; };
+struct TRIANGLE { vec3 position[3]; vec4 color[3]; };
+struct SingleVoxel { TRIANGLE triangle[5]; uint ntriang; };
 
 layout(buffer_reference, std430) buffer VertexBufferRef {
     Vertex vertices[];
@@ -56,16 +58,8 @@ layout(buffer_reference, std430) buffer IndexBufferRef {
     uint indices[];
 };
 
-layout(buffer_reference, std430) buffer CounterBufferRef {
-    uint totalAllocatedVertices;
-};
-
-layout(buffer_reference, std430) buffer IndirectCommandRef {
-    DrawIndexedIndirectCommand commands[];
-};
-
-layout(buffer_reference, std430) buffer IndirectRangeBufferRef {
-    AccelerationStructureBuildRangeInfo accstruct;
+layout(buffer_reference, std430) readonly buffer ChunkMetadataBufferRef { 
+    ChunkMetadata chunkData[]; 
 };
 
 layout(std140, set = 0, binding = 0) uniform MCUniformBuffer {
@@ -74,19 +68,19 @@ layout(std140, set = 0, binding = 0) uniform MCUniformBuffer {
 } u_mcTables;
 
 layout(push_constant) uniform PushConstants {
-    VertexBufferRef outputVertexBuffer;
-    IndexBufferRef  outputIndexBuffer;  
-    IndirectCommandRef indirectCmdBuffer;
-    CounterBufferRef global_offset;             
-    IndirectRangeBufferRef rangeBuffer;
-    uint  indirectBufferNum;      
-    vec4 inputStartPosition; 
+    VertexBufferRef        outputVertexBuffer;
+    IndexBufferRef         outputIndexBuffer;  
+    //여기서부터 이제 indirect를 관리를 들어갈 것이다
+    ChunkMetadataBufferRef chunkMetadataBuffer;
+    //terrain전체 startPosition이다
+    vec4                   inputStartPosition;  
+    uvec4                  chunkGridDim;
 } push;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
-shared uint groupTriangleCount; 
-shared uint groupGlobalBaseIndex;
+shared uint groupWorkgroupOffset;
+shared uint groupBaseVertexIndex;
 
 int getTriTableValue(uint cubeIndex, int i) {
     int row = i / 4;
@@ -98,6 +92,15 @@ int getEdgeFlags(uint cubeIndex) {
     int row = int(cubeIndex) / 4;
     int col = int(cubeIndex) % 4;
     return u_mcTables.edgeTable[row][col];
+}
+//이것은 각각 voxel에서 triangle갯수들이다 ㅇㅇ
+int getTriCount(uint cubeIndex) {
+    int count = 0;
+    for (int i = 0; i < 16; i += 3) {
+        if (u_mcTables.triTable[cubeIndex].triRows[i / 4][i % 4] == -1) break;
+        count += 3;
+    }
+    return count;
 }
 
 vec2 randomGradiantVector(vec2 gridEdge) {
@@ -158,8 +161,6 @@ SingleVoxel marching_cube_calculation(GRIDCELL grid, vec4 color) {
     uint ntriang = 0;
     vec3 vertlist[12];
     float isolevel = 0.0;
-    uint edgeFlags;
-
     TRIANGLE triangles[5];
 
     for(int i = 0; i < 8; i++) {
@@ -167,7 +168,7 @@ SingleVoxel marching_cube_calculation(GRIDCELL grid, vec4 color) {
             cubeindex |= (1u << i);
         }
     }
-    edgeFlags = getEdgeFlags(cubeindex);
+    uint edgeFlags = uint(getEdgeFlags(cubeindex));
 
     if (edgeFlags == 0)
         return SingleVoxel(triangles, 0u);
@@ -190,49 +191,16 @@ SingleVoxel marching_cube_calculation(GRIDCELL grid, vec4 color) {
         triangles[ntriang].position[1] = vertlist[getTriTableValue(cubeindex, i+1)];
         triangles[ntriang].position[2] = vertlist[getTriTableValue(cubeindex, i+2)];
 
-	triangles[ntriang].color[0] = color;
-	triangles[ntriang].color[1] = color;
-	triangles[ntriang].color[2] = color;
-
-        triangles[ntriang].indicies[0] = i;
-        triangles[ntriang].indicies[1] = i + 1;
-        triangles[ntriang].indicies[2] = i + 2;
+        //triangles[ntriang].indicies[0] = i;
+        //triangles[ntriang].indicies[1] = i + 1;
+        //triangles[ntriang].indicies[2] = i + 2;
         ntriang += 1u;
     }
 
     return SingleVoxel(triangles, ntriang);
 }
-vec4 texture_implementaion(uint octave, float amplitude, float persistence, float current_height){
-    TerrainColor region[4];
-    region[0].color = vec4(0.0, 0.7, 0.0, 1.0);
-    region[0].height = 0.5;
-
-    region[1].color = vec4(0.0, 0.5, 0.0, 1.0);
-    region[1].height = 0.56;
-
-    region[2].color = vec4(0.5, 0.5, 0.5, 1.0);
-    region[2].height = 0.595;
-
-    region[3].color = vec4(1.0, 1.0, 1.0, 1.0);
-    region[3].height = 1.0;
-
-    // GLSL 등비수열 표현--> 이러면 총 크기를 알 수 있음 -155~155까지 일거임
-    float max_noise_val = amplitude * (1.0f - pow(persistence, float(octave))) / (1.0f - persistence);
-    //total_noise(terrain의 현제 위치)/max_noise_val(terrain 최대 위치)
-    //여기서 이미 0.0 ~ 1.0이 정해짐
-    float normalized_noise = (current_height / max_noise_val) * 0.5f + 0.5f;
-    //normalized_noise = clamp(normalized_noise, 0.0f, 1.0f);
-    for(int i = 0; i < region.length(); i++){
-	if(normalized_noise <= region[i].height){
-	    return region[i].color;
-	}
-    }
-}
 SingleVoxel evaluate_voxel(vec3 starting_point, vec3 id) {
-    uint GRID_RES = 32u;
-    float BLOCK_SIZE = 32.0f;
-    float STEP = BLOCK_SIZE / float(GRID_RES);
-    
+    float STEP = 1.0f; 
     vec3 UNIT_CUBE_OFFSETS[8] = {
         {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f},
         {1.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 1.0f},
@@ -240,108 +208,119 @@ SingleVoxel evaluate_voxel(vec3 starting_point, vec3 id) {
         {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f, 1.0f}
     };
 
-    float amplitude = 300.0f; 
-    float frequency = 0.005f; 
-    float persistence = 0.5f;
-    float lacunarity = 2.0f; 
-    uint octave = 7;
-
-    vec3 cellMinPos = starting_point + vec3(id.x * STEP, id.y * STEP, id.z * STEP);
-
+    vec3 cellMinPos = starting_point + (id * STEP);
     GRIDCELL gridcell;
-    vec4 color;
     for(int i = 0; i < 8; i++) {
         gridcell.p[i] = cellMinPos + (UNIT_CUBE_OFFSETS[i] * STEP);
         vec3 pos = gridcell.p[i];
         float total_noise = 0.0;
-        float current_amp = amplitude;
-        float current_freq = frequency;
+        float current_amp = noiseData.amplitude;
+        float current_freq = noiseData.frequency;
 	//전체 크기를 줌 아마 amplitude가 80이고 ocatve가 5면 -155~155의 크기를 총 줄거임
-        for (int j = 0; j < octave; j++) {
+        for (int j = 0; j < noiseData.octave; j++) {
             float surface = perlin_noise(pos.x * current_freq, pos.z * current_freq);
 	    //j = 0이면 대충 amplitude 가 80이라고 하면 크기는 noise에 따라서 크기를 줄것이다.
             total_noise += surface * current_amp;
-            current_amp *= persistence;
-            current_freq *= lacunarity;
+            current_amp *= noiseData.persistence;
+            current_freq *= noiseData.lacunarity;
         }
-	if(i == 0){
-	    //color = texture_implementaion(octave, amplitude, persistence, total_noise);
-	}
         gridcell.val[i] = total_noise - pos.y;
     }
     return marching_cube_calculation(gridcell, color);
 }
+//cube하나당 미리 빠르게 일단은 세기
+//일단 voxel_count.comp하고 똑같은걸 씀
+uint count_single_voxel(vec3 starting_point, vec3 id) {
+    float STEP = 1.0f;
+    vec3 cellMinPos = starting_point + (id * STEP);
+    vec3 UNIT_CUBE_OFFSETS[8] = {
+        {0,0,0}, {1,0,0}, {1,0,1}, {0,0,1},
+        {0,1,0}, {1,1,0}, {1,1,1}, {0,1,1}
+    };
+
+    uint cubeindex = 0u;
+    for(int i = 0; i < 8; i++) {
+        vec3 pos = cellMinPos + (UNIT_CUBE_OFFSETS[i] * STEP);
+        float total_noise = 0.0;
+        float current_amp = noiseData.amplitude;
+        float current_freq = noiseData.frequency;
+        for (int j = 0; j < 7; j++) {
+            total_noise += perlin_noise(pos.x * current_freq, pos.z * current_freq) * current_amp;
+            current_amp *= noiseData.persistence;
+            current_freq *= noiseData.lacunarity;
+        }
+        if ((total_noise - pos.y) < 0.0) cubeindex |= (1u << i);
+    }
+    if (getEdgeFlags(cubeindex) == 0) return 0u;
+    return uint(getTriCount(cubeindex));
+}
 
 void main() {
     uvec3 local_id = gl_LocalInvocationID;
-    uvec3 group_id = gl_WorkGroupID;
+    //일단 각각 chunk들의 ID
+    uint chunkID = gl_WorkGroupID.x + 
+		   gl_WorkGroupID.y * push.chunkGridDim.x + 
+                   gl_WorkGroupID.z * (push.chunkGridDim.x * push.chunkGridDim.y);
 
     if (gl_LocalInvocationIndex == 0u) {
-        groupTriangleCount = 0u;
+        groupWorkgroupOffset = 0u;
+	//IndirectDraw에서 chunk의 firstIndex만 쏙 가지고 옴 ㅇㅇ
+        groupBaseVertexIndex = push.chunkMetadataBuffer.chunkData[chunkID].drawCmd.firstIndex;
     }
     barrier(); 
+    // 청크 자체가 빈 경우(인스턴스 카운트 0) 즉시 조기 탈출(혹시 모르니깐)
+    if (push.chunkMetadataBuffer.chunkData[chunkID].drawCmd.instanceCount == 0u) {
+        return;
+    }
 
-    float CHUNK_SIZE = 32.0f;
-    vec3 starting_point = (vec3(group_id) * CHUNK_SIZE) + push.inputStartPosition.xyz;
+    vec3 starting_point = (vec3(gl_WorkGroupID) * 32.0f) + push.inputStartPosition.xyz;
 
-    SingleVoxel voxels[64];
-    uint localTriIndices[64];
+    //일단은 청크 하나의 모든 indicies갯수를 저장을 한다 aka 정점의 갯수들
     uint threadTotalIndices = 0u;
-
-    uint voxelIdx = 0u;
     for (uint x = 0u; x < 4u; x++) {
         for (uint y = 0u; y < 4u; y++) {
             for (uint z = 0u; z < 4u; z++) {
                 uvec3 voxel_id = (local_id * 4u) + uvec3(x, y, z);
-                //this contains the number of triangles and the triangles vertcies
-                voxels[voxelIdx] = evaluate_voxel(starting_point, vec3(voxel_id));
-                uint numIdx = voxels[voxelIdx].ntriang * 3u;
-                //number of triangles vertcies in each voxel
-                localTriIndices[voxelIdx] = numIdx;
-		//number of triangles vertcies in total
-                threadTotalIndices += numIdx;
-                voxelIdx++;
+                threadTotalIndices += count_single_voxel(starting_point, vec3(voxel_id));
             }
         }
     }
 
+    //groupWorkgroupOffset안에는 일단은 chunk하나의 모든 갯수들 저장 및
+    //threadTotalIndices안에는 그냥 갯수들 forloop으로 만든 반쪽자리다
+    //그리고 myLocalOffset은 그냥 워크그룹 안에 스레드들의 offset이다
     uint myLocalOffset = 0u;
     if (threadTotalIndices > 0u) {
-        myLocalOffset = atomicAdd(groupTriangleCount, threadTotalIndices);
+        myLocalOffset = atomicAdd(groupWorkgroupOffset, threadTotalIndices);
     }
 
     barrier();
-    if (gl_LocalInvocationIndex == 0u && groupTriangleCount > 0u) {
-        uint current_Index = push.indirectBufferNum;
-	//이전 workgroup에 총 indexCount를 가지고 옴(오로지 batch 총 index만 가지고 있음)
-        uint prevIndexCount = atomicAdd(push.indirectCmdBuffer.commands[current_Index].indexCount, groupTriangleCount);
-	//이전 workgroup에 총 indexCount를 가지고 옴(전체 terrain index를 가지고 옴)
-        groupGlobalBaseIndex = atomicAdd(push.global_offset.totalAllocatedVertices, groupTriangleCount);
-	//만약 이전 workgroup의 index가 0이면 이제 새로운 batch이므로 그냥 firstIndex에다가 우리 총 terrainIndex를 넣어줌
-	if (prevIndexCount == 0u) {
-            push.indirectCmdBuffer.commands[current_Index].firstIndex = groupGlobalBaseIndex;
-        }
-    }
-
-    barrier(); 
     if (threadTotalIndices > 0u) {
-        uint vertexWriteIdx = groupGlobalBaseIndex + myLocalOffset;
-	uint myTriangleCount = threadTotalIndices / 3u;
+	//실제 청크 offset + threadOffset
+	//threadOffset는 4*4*4 씩 떨어져서 계산을 함
+        uint vertexWriteIdx = groupBaseVertexIndex + myLocalOffset;
 
-        for (uint v = 0u; v < 64u; v++) {
-            if (voxels[v].ntriang > 0u) {
-                for (uint i = 0u; i < voxels[v].ntriang; i++) {
-                    push.outputVertexBuffer.vertices[vertexWriteIdx + 0u].position = voxels[v].triangle[i].position[0];
-                    push.outputVertexBuffer.vertices[vertexWriteIdx + 1u].position = voxels[v].triangle[i].position[1];
-                    push.outputVertexBuffer.vertices[vertexWriteIdx + 2u].position = voxels[v].triangle[i].position[2];
+        for (uint x = 0u; x < 4u; x++) {
+            for (uint y = 0u; y < 4u; y++) {
+                for (uint z = 0u; z < 4u; z++) {
+                    uvec3 voxel_id = (local_id * 4u) + uvec3(x, y, z);
+                    SingleVoxel vox = evaluate_voxel(starting_point, vec3(voxel_id));
+                    for (uint i = 0u; i < vox.ntriang; i++) {
+                        // 삼각형 면의 노멀 계산
+                        vec3 edgeA = vox.triangle[i].position[1] - vox.triangle[i].position[0];
+                        vec3 edgeB = vox.triangle[i].position[2] - vox.triangle[i].position[0];
+                        vec3 triNormal = normalize(cross(edgeA, edgeB));
 
-                    push.outputIndexBuffer.indices[vertexWriteIdx + 0u] = vertexWriteIdx + 0u;
-                    push.outputIndexBuffer.indices[vertexWriteIdx + 1u] = vertexWriteIdx + 1u;
-                    push.outputIndexBuffer.indices[vertexWriteIdx + 2u] = vertexWriteIdx + 2u;
-                    vertexWriteIdx += 3u;
+                        for (uint k = 0u; k < 3u; k++) {
+                            push.outputVertexBuffer.vertices[vertexWriteIdx].position = vox.triangle[i].position[k];
+                            push.outputVertexBuffer.vertices[vertexWriteIdx].normal   = triNormal;
+			    //이거는 필요가 없는 것이다 나중에 vkCmdIndirectDraw로 바꿔야함!!
+                            push.outputIndexBuffer.indices[vertexWriteIdx] = vertexWriteIdx;
+                            vertexWriteIdx++;
+                        }
+                    }
                 }
             }
         }
-	atomicAdd(push.rangeBuffer.accstruct.primitiveCount, myTriangleCount);
     }
 }
