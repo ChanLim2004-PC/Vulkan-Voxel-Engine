@@ -7,6 +7,7 @@
 #include "vk_loader.h"
 #include "vk_scene.h"
 #include "camera.h"
+#include "voxel_compute_pipeline.h"
 #include "voxeldata.h"
 #include "mac_algoo_data.h"
 #include "raytracing.h"
@@ -139,9 +140,9 @@ public:
     float deltaTime;
     //engine이 재대로 켜졌는지
     bool _isInitialized{ false };
+    bool _initialize_once { false };
     bool _chunkIntialized{ false };
-    bool _chunkFinishedInitilized{ false };
-    bool start_scene {false};
+
     //몇번째 프레임을 그려주고 있어??
     int _frameNumber {0};
     bool stop_rendering{ false };
@@ -188,9 +189,10 @@ public:
     //씬 관련 데이터
     GPUSceneData sceneData;
 
-    //voxelModelMatrix 과연 버퍼 데이터
     VoxelModel voxelModel;
     ChunkSystem chunkSystem;
+    VoxelPipeline voxelPipeline;
+
     //Culling 관련된 버퍼 데이터
     ExecuteCulling executeCulling;
 
@@ -202,6 +204,9 @@ public:
     VkPipelineLayout _voxeldataPipelineLayout;
     VkPipelineLayout _cullPipelineLayout;
     CullComputePipelineData cullCompute;
+
+    VoxelComputePipeline _voxelCountPipeline;
+    VoxelComputePipeline _prefixPipeline;
 
     //컴퓨트파이프라인 셋업
     CullComputePipeline cullComputePipeline;
@@ -255,6 +260,7 @@ public:
     //디스크립터
     //새로운 CullUniformBufferData
     CullUniformBufferData cullUniformBuffer;
+    NoiseUniformBuffer noiseUniformBuffer;
     //새로운 디스크립터(래이트레이싱)
     RayTracerUniformBuffer rayTracingUniformBuffer;
     RayTracingBuffer rayTracingBuffer;

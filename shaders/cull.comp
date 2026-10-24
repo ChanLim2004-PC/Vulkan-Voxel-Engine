@@ -12,23 +12,30 @@ struct Vertex {
 struct VoxelObject{
     vec3 center;
     float radius;
-    vec4 sphereBounds;
 };
 
-struct DrawIndexedIndirectCommand {
-    uint indexCount;
-    uint instanceCount;
-    uint firstIndex;
-    int  vertexOffset;
-    uint firstInstance;
+struct DrawIndirectCommands {
+    uint vertexCount;   
+    uint instanceCount; 
+    uint firstVertex;   
+    uint firstInstance; 
 };
 
-layout(buffer_reference, std430) buffer BatchOffsetRef {
-    vec4 offsets[];
+struct ChunkMetadata {
+    DrawIndirectCommands drawCmd;    
+    vec4 aabbMin;
+    vec4 aabbMax;
+    //ASBuildRangeInfo blasRange;  
+    uint chunkID;
+    uint flags;      
+    uint _pad[2];
 };
 
 layout(buffer_reference, std430) buffer IndirectCommandRef {
-    DrawIndexedIndirectCommand commands[]; 
+    DrawIndirectCommands commands[]; 
+};
+layout(buffer_reference, std430) buffer ChunkMetaBufferRef{
+    ChunkMetadata chunk[]; 
 };
 
 layout(buffer_reference, std430) buffer DrawCountBufferRef {
@@ -37,11 +44,9 @@ layout(buffer_reference, std430) buffer DrawCountBufferRef {
 
 layout(push_constant) uniform PushConstants {
     IndirectCommandRef finalIndirectCmdBuffer;
-    IndirectCommandRef indirectCmdBuffer;
-    BatchOffsetRef batchOffsetBuffer;
+    ChunkMetaBufferRef originalChunkData;
     DrawCountBufferRef drawCounterBuffer;
-    vec4 inputStartPosition; 
-    uint batch_index;
+    uint totalChunkCount;
 } push;
 
 layout(std140, set = 0, binding = 0) uniform cullUniformBuffer {
@@ -56,19 +61,18 @@ layout(std140, set = 0, binding = 0) uniform cullUniformBuffer {
     float pyramidHeight;        
 }cullData;
 
-VoxelObject voxelObjectData(uint gID){
-    VoxelObject voxelObject;
-    //use this for now(this is going inisde UBO)
-    float chunk_size = 32.0f;
-    int batch_index = 2;
-
-    float batch_size = chunk_size * batch_index;
-    voxelObject.center = push.batchOffsetBuffer.offsets[gID].xyz + vec3(batch_size/2);
-    voxelObject.radius = distance(push.batchOffsetBuffer.offsets[gID].xyz, voxelObject.center);
-    voxelObject.sphereBounds = vec4(voxelObject.center, voxelObject.radius);
-
-    return voxelObject;
+// 별도 오프셋 버퍼 없이 ChunkMetadata의 AABB를 활용해 바운딩 구 생성
+VoxelObject voxelObjectData(uint gID) {
+    VoxelObject obj;
+    vec3 minP = push.originalChunkData.chunk[gID].aabbMin.xyz;
+    vec3 maxP = push.originalChunkData.chunk[gID].aabbMax.xyz;
+    //중심
+    obj.center = (minP + maxP) * 0.5f;
+    //반지름
+    obj.radius = length(maxP - minP) * 0.5f; // 중심에서 모서리까지의 거리
+    return obj;
 }
+
 bool IsVisible(uint gID){
     VoxelObject voxelObject = voxelObjectData(gID);
     vec3 center = (cullData.view * vec4(voxelObject.center, 1.f)).xyz;
@@ -76,10 +80,10 @@ bool IsVisible(uint gID){
     center.z = -center.z;
     bool visible = true;
 
+
     visible = visible && (center.z * cullData.frustum.y - abs(center.x) * cullData.frustum.x > -radius);
     visible = visible && (center.z * cullData.frustum.w - abs(center.y) * cullData.frustum.z > -radius);
     visible = visible && center.z + radius > cullData.znear && center.z - radius < cullData.zfar;
-
     visible = visible || (cullData.cullingEnabled == 0);
 
     return visible;
@@ -89,13 +93,19 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 void main(){
     uint gID = gl_GlobalInvocationID.x;
-    if(gID < cullData.drawCount)
-    {
-	if (IsVisible(gID)) {
-	    uint targetIndex = atomicAdd(push.drawCounterBuffer.drawcount, 1);
-	    DrawIndexedIndirectCommand cmd = push.indirectCmdBuffer.commands[gID];
-	    cmd.instanceCount = 1;
-	    push.finalIndirectCmdBuffer.commands[targetIndex] = cmd;
-	}
+    if (gID < push.totalChunkCount) {
+	//오리지널
+        DrawIndirectCommands originalCmd = push.originalChunkData.chunk[gID].drawCmd;
+	//걍 보이는 것만 카트에 담아서 집어넣기
+        if (originalCmd.vertexCount > 0u && IsVisible(gID)) {
+            // 원자적으로 압축 버퍼의 다음 슬롯 번호 확보
+            uint targetIndex = atomicAdd(push.drawCounterBuffer.drawcount, 1u);
+
+            DrawIndirectCommands cmd = originalCmd;
+            cmd.instanceCount = 1u;
+
+            // 최종 렌더링용 간접 드로우 버퍼에 패킹
+            push.finalIndirectCmdBuffer.commands[targetIndex] = cmd;
+        }
     }
 }

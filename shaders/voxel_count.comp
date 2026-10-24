@@ -1,20 +1,12 @@
 #version 450
 #extension GL_EXT_buffer_reference : require
 
-struct DrawIndexedIndirectCommand {
-    uint indexCount;
-    uint instanceCount;
-    uint firstIndex;
-    int  vertexOffset;
-    uint firstInstance;
+struct DrawIndirectCommand{
+    uint vertexCount;   
+    uint instanceCount; 
+    uint firstVertex;   
+    uint firstInstance; 
 };
-
-/*struct ASBuildRangeInfo {
-    uint primitiveCount;   
-    uint primitiveOffset; 
-    uint firstVertex;      
-    uint transformOffset;
-};*/
 
 //이것은 아마 나중에 UBO처리 할 가능성이 높음
 struct PerlinNoiseData {
@@ -27,21 +19,24 @@ struct PerlinNoiseData {
 const PerlinNoiseData noiseData = PerlinNoiseData(300.0f, 0.005f, 0.5f, 2.0f, 7u);
 
 struct ChunkMetadata {
-    DrawIndexedIndirectCommand drawCmd;    
-    //일단은 여기는 봉인을 해둔다(RAYTRACING 단계에서 activate)
-    //ASBuildRangeInfo blasRange;  
+    DrawIndirectCommand drawCmd;    
     vec4 aabbMin;
     vec4 aabbMax;
     uint chunkID;
     //1은 dirty, 0은 air
     uint flags;      
+    uint _pad[2];
 };
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
-layout(buffer_reference, std430) buffer ChunkCountBufferRef {
+layout(buffer_reference, std430) buffer ChunkMetaBufferRef {
     //청크별 정점을 새는 코드
     ChunkMetadata chunkData[]; 
+};
+layout(buffer_reference, std430) buffer PrevCordBufferRef {
+    //청크별 정점을 새는 코드
+    vec4 cord[]; 
 };
 
 struct MCData { ivec4 triRows[4]; };
@@ -53,7 +48,8 @@ layout(std140, set = 0, binding = 0) uniform MCUniformBuffer {
 } u_mcTables;
 
 layout(push_constant) uniform PushConstants {
-    ChunkCountBufferRef chunkCountBuffer;
+    ChunkMetaBufferRef chunkCountBuffer;
+    PrevCordBufferRef prevCordBuffer;
     //우리 전체 시작 index
     vec4 inputStartPosition;
     //dispatch에 시작점
@@ -78,8 +74,8 @@ vec2 randomGradiantVector(vec2 gridEdge) {
     gradient = sin(gradient);
     return gradient;
 }
-//노이즈 함수
 
+//노이즈 함수
 float perlin_noise(float noiseX, float noiseZ) {
     vec2 amoutOfChunk = vec2(noiseX, noiseZ);
     vec2 gridID = floor(amoutOfChunk);
@@ -161,7 +157,28 @@ uint count_voxel(vec3 starting_point, vec3 id) {
     return uint(getTriCount(cubeindex));
 }
 
+ivec3 mod3D(ivec3 v, ivec3 m) {
+    return ((v % m) + m) % m;
+}
+ivec3 safeMod3D(ivec3 coord, ivec3 dim) {
+    vec3 c = vec3(coord);
+    vec3 d = vec3(dim);
+    return ivec3(c - (d * floor(c / d)));
+}
 void main() {
+    ivec3 minChunkCoord   = ivec3(floor(push.inputStartPosition.xyz / 32.0));
+    ivec3 worldChunkCoord = minChunkCoord + ivec3(gl_WorkGroupID);
+    //ivec3 slot3D = mod3D(worldChunkCoord, ivec3(push.chunkGridDim.xyz));
+    ivec3 slot3D = safeMod3D(worldChunkCoord, ivec3(push.chunkGridDim.xyz));
+    vec3 starting_point = vec3(worldChunkCoord) * 32.0f;
+    vec4 currentCord = vec4(worldChunkCoord, 1.0);
+    uint chunkID = slot3D.x + slot3D.y * push.chunkGridDim.x + slot3D.z * (push.chunkGridDim.x * push.chunkGridDim.y);
+    //uint chunkID = gl_WorkGroupID.x + gl_WorkGroupID.y * push.chunkGridDim.x + gl_WorkGroupID.z * (push.chunkGridDim.x * push.chunkGridDim.y);
+    //기존하고 비교를 해서 만약 똑같으면 스킵
+    if (push.prevCordBuffer.cord[chunkID] == currentCord) {
+        return; 
+    }
+
     uvec3 local_id = gl_LocalInvocationID;
     if (gl_LocalInvocationIndex == 0u) {
 	//local_id 가 8*8*8 정도 되는데 
@@ -170,9 +187,9 @@ void main() {
     }
     barrier();
 
-    //chunk의 시작점 전체적인 좌표료 봤을때
-    vec3 starting_point = (vec3(gl_WorkGroupID) * 32.0f) + push.inputStartPosition.xyz;
+
     uint threadTotalVertices = 0u;
+    uint totalChunkCount = push.chunkGridDim.x * push.chunkGridDim.y * push.chunkGridDim.z;
 
     for (uint x = 0u; x < 4u; x++) {
         for (uint y = 0u; y < 4u; y++) {
@@ -183,7 +200,7 @@ void main() {
             }
         }
     }
-
+    
     //여기에서 이제 groupVertexCount에다가 다 넣음 그러면 chunk하나 vertcies count가 완서이 될꺼다
     if (threadTotalVertices > 0u) {
         atomicAdd(groupVertexCount, threadTotalVertices);
@@ -192,18 +209,19 @@ void main() {
     barrier();
 
     if (gl_LocalInvocationIndex == 0u) {
-	uint chunkID = gl_WorkGroupID.x + gl_WorkGroupID.y * push.chunkGridDim.x + gl_WorkGroupID.z * (push.chunkGridDim.x * push.chunkGridDim.y);
 	//이제 각각 chunkID에다가 다 넣음
 	//여기는 indirectDraw fillin
-        push.chunkCountBuffer.chunkData[chunkID].drawCmd.indexCount = groupVertexCount;
+        push.chunkCountBuffer.chunkData[chunkID].drawCmd.vertexCount = groupVertexCount;
 	push.chunkCountBuffer.chunkData[chunkID].drawCmd.instanceCount = (groupVertexCount > 0u) ? 1u : 0u;
-	push.chunkCountBuffer.chunkData[chunkID].drawCmd.vertexOffset  = 0;
 	push.chunkCountBuffer.chunkData[chunkID].drawCmd.firstInstance = 0u;
-
 	//여기는 나머지 chunkData 부수적인 데이터들 fill in
 	push.chunkCountBuffer.chunkData[chunkID].chunkID = chunkID;
 	push.chunkCountBuffer.chunkData[chunkID].aabbMin = vec4(starting_point, 1.0f);
 	push.chunkCountBuffer.chunkData[chunkID].aabbMax = vec4(starting_point + 32.0f, 1.0f);
-	push.chunkCountBuffer.chunkData[chunkID].flags = (groupVertexCount > 0u) ? 1u : 0u;;
+
+	// 플래그: ACTIVE (bit 0) | DIRTY (bit 1)
+	push.chunkCountBuffer.chunkData[chunkID].flags = (groupVertexCount > 0u ? 1u : 0u) | 2u;
+	//prev를 이제 새로 갱신
+        push.prevCordBuffer.cord[chunkID] = currentCord;
     }
 }

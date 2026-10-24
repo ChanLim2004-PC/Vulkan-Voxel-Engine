@@ -13,6 +13,7 @@
 #include <array>
 #include <functional>
 #include <deque>
+#include <iostream>
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_enum_string_helper.h>
@@ -24,14 +25,15 @@
 #include <glm/vec4.hpp>
 
 //에러를 검사를 하는 코드다
-#define VK_CHECK(x)                                                     \
-    do {                                                                \
-        VkResult err = x;						\
-        if (err) {                                                      \
-             fmt::print("Detected Vulkan error: {}", string_VkResult(err)); \
-            abort();                                                    \
-        }                                                               \
-    } while (0) // 맨 마지막 줄에는 역슬래시를 안 붙여도 돼.
+#define VK_CHECK(x) \
+    do { \
+        VkResult err = x; \
+        if (err) { \
+            std::cerr << "\n VK_CHECK FAILED! Error Code: " << (int)err \
+                      << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
+            abort(); \
+        } \
+    } while (0)
 
 //image 관련 memory allocation
 struct AllocatedImage {
@@ -76,44 +78,40 @@ struct Vertex {
     glm::vec4 color;
 };
 
-struct ChunkSlot {
-    glm::ivec3 chunkCoord;// 청크 그리드 위치 (예: 2, 0, -5)
-    bool isDirty = true;// 지형 갱신 필요 여부
-    bool isAir = false;// 빈 공기 청크 여부
-
-    uint32_t slotIndex = 0; // SSBO 내 슬롯 번호
-    uint32_t firstIndex = 0;//SSBO 정점 오프셋
-
-    VkAccelerationStructureKHR blasHandle = VK_NULL_HANDLE;
-    VkDeviceAddress blasAddress = 0;
+struct ChunkMetaData {
+    VkDrawIndirectCommand drawCmd;    
+    VkAccelerationStructureBuildRangeInfoKHR blasRange;  
+    glm::vec4 aabbMin;
+    glm::vec4 aabbMax;
+    uint32_t chunkID;
+    //1은 dirty, 0은 air
+    uint32_t flags;      
+    uint32_t _pad[2];
 };
 
 struct GPUMeshBuffers {
-    AllocatedBuffer indexBuffer;
     AllocatedBuffer vertexBuffer;
-    AllocatedBuffer indirectCmdBuffer;
-    AllocatedBuffer globalOffsetBuffer;
-    AllocatedBuffer batchOffsetBuffer;
+    AllocatedBuffer prevCordBuffer;
+    AllocatedBuffer indexBuffer;
     AllocatedBuffer drawCounterBuffer;
     AllocatedBuffer finalIndirectBuffer;
+    AllocatedBuffer chunkMetaBuffer;
     AllocatedBuffer indirectRangeBuffer;
-    //binding 과정 vulkan 1.0처럼 더이상 vkCmdBindVertexBuffers같은건 필요가 없어
+
     VkDeviceAddress vertexBufferAddress;
+    VkDeviceAddress prevCordBufferAddress;
     VkDeviceAddress indexBufferAddress;
-    VkDeviceAddress indirectCmdBufferAddress;
-    VkDeviceAddress globalOffsetBufferAddress;
-    VkDeviceAddress batchOffsetBufferAddress;
     VkDeviceAddress drawCounterBufferAddress;
     VkDeviceAddress finalIndirectBufferAddress;
+    VkDeviceAddress chunkMetaBufferAddress;
     VkDeviceAddress indirectRangeBufferAddress;
 
-    //blas
-
+    //blas(not going to use right now)
+    std::vector<VkAccelerationStructureKHR> blasHandles;
+    std::vector<VkDeviceAddress> blasDeviceAddresses;
     AllocatedBuffer blasBuffer;
-    VkAccelerationStructureKHR blasHandle;
-    VkDeviceAddress blasDeviceAddress;
-
     AllocatedBuffer scratchBuffer;
+    //voxelCount
 };
 
 struct RayTracingBuffer{
@@ -145,28 +143,6 @@ struct RayTracerUniformBuffer{
     VkDescriptorSet RayTracerDescriptor;
     AllocatedBuffer RayTracerShaderBuffer;
 };
-
-struct MarchingCubeBuffer {
-    std::array<int, 256> edgeTable;
-    std::array<std::array<int, 16>, 256> triTable;
-};
-
-struct alignas(16) DrawMeshBuffer {
-    glm::mat4 worldMatrix;
-    VkDeviceAddress outputVertexBuffer;
-};
-
-// push constants for our mesh object draws(이제는 단순히 보내는것이 아닌 Output은 너다)
-struct GPUDrawPushConstants {
-    VkDeviceAddress outputVertexBuffer;
-    VkDeviceAddress outputIndexBuffer;
-    VkDeviceAddress indirectCmdBuffer;
-    VkDeviceAddress globalOffsetCmdBuffer;
-    VkDeviceAddress indirectRangeBuffer;
-    uint64_t indirectBufferNum;    
-    glm::vec4 starting_push_constant;
-};
-
 struct GPUCullData {
     glm::mat4 view;              
     glm::vec4 frustum;            
@@ -178,14 +154,44 @@ struct GPUCullData {
     float pyramidWidth;          
     float pyramidHeight;        
 };
+
+struct MarchingCubeBuffer {
+    std::array<int, 256> edgeTable;
+    std::array<std::array<int, 16>, 256> triTable;
+};
+
+struct alignas(16) DrawMeshBuffer {
+    glm::mat4 worldMatrix;
+    VkDeviceAddress outputVertexBuffer;
+};
+
+struct VoxelCountPushConstants {
+    VkDeviceAddress chunkMetaBuffer;
+    VkDeviceAddress prevCordBuffer;
+    glm::vec4 inputStartPosition;
+    glm::uvec4 chunkGridDim;
+};
+
+struct PrefixPushConstants{
+    VkDeviceAddress chunkMetaBuffer;
+    uint32_t totalChunkCount;
+    uint32_t _pad;
+};
+// push constants for our mesh object draws(이제는 단순히 보내는것이 아닌 Output은 너다)
+struct GPUDrawPushConstants {
+    VkDeviceAddress outputVertexBuffer;
+    VkDeviceAddress chunlMetaData;
+    VkDeviceAddress rangeBuffer;
+    uint32_t _pad[2];
+    glm::vec4 starting_push_constant;
+    glm::uvec4 girdDim;
+};
 //Culling할때 필요한 PushConstant
 struct CullComputePushConstant{
     VkDeviceAddress finalIndirectBuffer;
-    VkDeviceAddress indirectCmdBuffer;
-    VkDeviceAddress batchOffsetBuffer;
+    VkDeviceAddress ChunkMetaDataBuffer;
     VkDeviceAddress drawCounterBuffer;
-    uint64_t indirectBufferNum;    
-    glm::vec4 starting_push_constant;
+    uint32_t total_chunk_count;
 };
 
 //fragmentShader을 위한 전용 버퍼

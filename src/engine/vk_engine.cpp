@@ -70,16 +70,17 @@ void VulkanEngine::init_vulkan()
     //와이어프레임
     deviceFeatures.fillModeNonSolid = VK_TRUE; 
     deviceFeatures.multiDrawIndirect = VK_TRUE;
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+        .pNext = nullptr,
+        .rayQuery = VK_TRUE
+    };
 
     VkPhysicalDeviceAccelerationStructureFeaturesKHR accelFeatures{
 	.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+	.pNext = nullptr,
 	.accelerationStructure = VK_TRUE,
-	//.accelerationStructureIndirectBuild = VK_TRUE
-    };
-
-    VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{
-	.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
-	.rayQuery = VK_TRUE
+	.accelerationStructureIndirectBuild = VK_TRUE
     };
 
     //use vkbootstrap to select a gpu. 
@@ -91,7 +92,7 @@ void VulkanEngine::init_vulkan()
 	.set_required_features_13(features)
 	.set_required_features_12(features12)
 	.set_required_features(deviceFeatures)
-	.add_required_extension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)   
+	.add_required_extension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)  
 	.add_required_extension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) 
 	.add_required_extension(VK_KHR_RAY_QUERY_EXTENSION_NAME)             
 	.add_required_extension_features(accelFeatures)
@@ -419,8 +420,10 @@ void VulkanEngine::init_descriptors()
 void VulkanEngine::init_pipelines()
 {
     init_background_pipelines();
-    init_compute_pipeline();
     init_graphics_pipeline();
+    init_compute_pipeline();
+    voxelPipeline.init_voxel_count_pipeline(this, &_voxelCountPipeline.layout, &_voxelCountPipeline);
+    voxelPipeline.init_prefix_pipeline(this, &_prefixPipeline.layout, &_prefixPipeline);
     cullComputePipeline.init_cullcompute_pipeline(this, &_cullPipelineLayout, &cullCompute, &cullUniformBuffer);
     metalRoughMaterial.build_pipelines(this);
 }
@@ -544,12 +547,12 @@ void VulkanEngine::init_compute_pipeline(){
     //이제 단순히 디스크립터 뿐만 아닌 pushConstant도 추가한것이다
     computeLayout.pPushConstantRanges = &pushConstant;
     computeLayout.pushConstantRangeCount = 1;
-
+    VkShaderModule compShader = VK_NULL_HANDLE;
     VK_CHECK(vkCreatePipelineLayout(_device, &computeLayout, nullptr, &_voxeldataPipelineLayout));
 
-    VkShaderModule compShader;
     if(!vkutil::load_shader_module("./spv/voxel.comp.spv", _device, &compShader)){
 	fmt::print("Error when building the voxel compute shader module");
+	return;
     }
     //shader상세 정보들
     VkPipelineShaderStageCreateInfo stageinfo{};
@@ -570,7 +573,8 @@ void VulkanEngine::init_compute_pipeline(){
     //이제 compute shader를 실제로 가지고 온다 ㅇㅇ.
     voxelComputeEffect.layout = _voxeldataPipelineLayout;
     voxelComputeEffect.name = "voxel_data";
-    VK_CHECK(vkCreateComputePipelines(_device,VK_NULL_HANDLE,1,&computePipelineCreateInfo, nullptr, &voxelComputeEffect.pipeline));
+
+    vkCreateComputePipelines(_device, VK_NULL_HANDLE, 1, &computePipelineCreateInfo, nullptr, &voxelComputeEffect.pipeline);
 
     vkDestroyShaderModule(_device, compShader, nullptr);
     _mainDeletionQueue.push_function([=,this](){
@@ -789,7 +793,6 @@ AllocatedBuffer VulkanEngine::create_buffer(size_t allocSize, VkBufferUsageFlags
 //택스처 관련된 함수 (텍스처 실제로 만들기)
 AllocatedImage VulkanEngine::create_image(VkExtent3D size, VkFormat format, VkImageUsageFlags usage, bool mipmapped)
 {
-
     AllocatedImage newImage;
     newImage.imageFormat = format;
     newImage.imageExtent = size;
@@ -1059,22 +1062,20 @@ void VulkanEngine::init()
     init_descriptors();	
 
     //파이프라인 시작
+    compute_descriptor();
     init_pipelines();
     init_imgui();
     init_default_position();
     init_default_data();
-    compute_descriptor();
 
     //buffer_set_up
     cullComputePipeline.culling_create_buffer(this, &chunkSystem);
-    //raytracer setup
     rayTracer.initRayTracingFunctions(_device);
 
     //엔진이 준비가 완료 됬으므로 true
     _isInitialized = true;
     _chunkIntialized = true;
-    _chunkFinishedInitilized = true;
-    start_scene = true;
+    _initialize_once = true;
 }
 //frsutum culling(1.0~-1.0까지 화면에 전체 크기인데 이거 밖으로 나가면 안그린다)
 bool is_visible(const RenderObject& obj, const glm::mat4& viewproj) {
@@ -1195,7 +1196,6 @@ void VulkanEngine::init_default_position(){
     mainCamera.position = glm::vec3(0, 5, 5);
     mainCamera.pitch = 0;
     mainCamera.yaw = 0;
-    starting_position = glm::vec4(0.0, 0.0, 0.0, 1.0);
 }
 void VulkanEngine::init_default_data() {
     //이거는 그냥 샊갈 color
@@ -1326,97 +1326,44 @@ void VulkanEngine::update_scene()
 }
 
 void VulkanEngine::compute_buffer(){
-    if (chunkSystem._meshBuffers[0].vertexBuffer.buffer == VK_NULL_HANDLE) {
-	//이거 무조건 바꿔야 함. heavly not optimized bull shit
-        current_indices_size = 10000000;
-        current_vertcies_size = 10000000;
+    if (chunkSystem._meshBuffers.vertexBuffer.buffer == VK_NULL_HANDLE) {
+        current_vertcies_size = chunkSystem.indirect_buffer_size * chunkSystem.max_buffer;
 	maxIndicies = current_indices_size;
-	for(int i = 0; i < 2; i++){
-	    chunkSystem._meshBuffers[i].vertexBuffer = create_buffer(
-		sizeof(Vertex) * current_vertcies_size, 
-		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, 
-		VMA_MEMORY_USAGE_GPU_ONLY
-	    );
+	chunkSystem._meshBuffers.vertexBuffer = create_buffer(
+	    sizeof(Vertex) * current_vertcies_size, 
+	    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, 
+	    VMA_MEMORY_USAGE_GPU_ONLY
+	);
+	chunkSystem._meshBuffers.chunkMetaBuffer = create_buffer(
+	    sizeof(ChunkMetaData) * chunkSystem.indirect_buffer_size,
+	    VK_BUFFER_USAGE_TRANSFER_DST_BIT | 
+	    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
+	    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+	    VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+	    VMA_MEMORY_USAGE_CPU_TO_GPU
+	);
+	chunkSystem._meshBuffers.indirectRangeBuffer = create_buffer(
+	    sizeof(VkAccelerationStructureBuildRangeInfoKHR) * chunkSystem.indirect_buffer_size,
+	    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+	    VK_BUFFER_USAGE_TRANSFER_DST_BIT | 
+	    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
+	    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | 
+	    VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+	    VMA_MEMORY_USAGE_CPU_TO_GPU
+	);
 
-	    chunkSystem._meshBuffers[i].indexBuffer = create_buffer(
-		sizeof(uint32_t) * current_indices_size, 
-		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, 
-		VMA_MEMORY_USAGE_GPU_ONLY
-	    );
-
-	    chunkSystem._meshBuffers[i].indirectCmdBuffer = create_buffer(
-		sizeof(VkDrawIndexedIndirectCommand) * chunkSystem.indirect_buffer_size,
-		VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, 
-		VMA_MEMORY_USAGE_GPU_TO_CPU
-	    );
-
-	    chunkSystem._meshBuffers[i].globalOffsetBuffer = create_buffer(
-		sizeof(uint64_t),
-		VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, 
-		VMA_MEMORY_USAGE_GPU_TO_CPU
-	    );
-
-	    chunkSystem._meshBuffers[i].indirectRangeBuffer = create_buffer(
-		sizeof(VkAccelerationStructureBuildRangeInfoKHR),
-		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
-		VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | 
-		VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
-		VMA_MEMORY_USAGE_GPU_ONLY
-	    );
-
-	    // Deletion Queue에는 프로그램 종료 시 파기할 용도로 딱 1번만 등록!
-	    _mainDeletionQueue.push_function([this, i](){
-		destroy_buffer(chunkSystem._meshBuffers[i].indexBuffer);
-		destroy_buffer(chunkSystem._meshBuffers[i].vertexBuffer);
-		destroy_buffer(chunkSystem._meshBuffers[i].indirectCmdBuffer);
-		destroy_buffer(chunkSystem._meshBuffers[i].globalOffsetBuffer);
-		destroy_buffer(chunkSystem._meshBuffers[i].indirectRangeBuffer);
-	    });
-	    compute_address_helper(&chunkSystem._meshBuffers[i]);
-	}
-	return;
+	// Deletion Queue에는 프로그램 종료 시 파기할 용도로 딱 1번만 등록!
+	AllocatedBuffer tempBuffer1 = chunkSystem._meshBuffers.chunkMetaBuffer;
+	AllocatedBuffer tempBuffer2 = chunkSystem._meshBuffers.vertexBuffer;
+	AllocatedBuffer tempBuffer3 = chunkSystem._meshBuffers.indirectRangeBuffer;
+	_mainDeletionQueue.push_function([this, tempBuffer1, tempBuffer2, tempBuffer3](){
+	    destroy_buffer(tempBuffer3);
+	    destroy_buffer(tempBuffer2);
+	    destroy_buffer(tempBuffer1);
+	});
+	compute_address_helper(&chunkSystem._meshBuffers); 
     }
 
-    VkDrawIndexedIndirectCommand* indexcountData = nullptr;
-    vmaMapMemory(_allocator,chunkSystem._meshBuffers[1].indirectCmdBuffer.allocation, (void**)&indexcountData);
-    uint64_t currentIndicies = indexcountData->indexCount;
-    vmaUnmapMemory(_allocator, chunkSystem._meshBuffers[1].indirectCmdBuffer.allocation);
-    float indicies_percentage = (float)currentIndicies/(float)maxIndicies;
-
-    if((indicies_percentage) >= 0.8 ){
-	fmt::print("do we get here");
-	//그냥 이전 그래픽(이전 프레임의 Draw Call, Compute, BLAS 빌드) 작업들이 끝날때까지 기다린다.
-	vkDeviceWaitIdle(_device);
-	current_indices_size = current_indices_size *2;
-	current_vertcies_size = current_vertcies_size *2;
-	for(int i = 0; i < 2; i++){
-	    //_output을 담을 공간을 파기.
-	    chunkSystem._meshBuffers[i].vertexBuffer = create_buffer(sizeof(Vertex) * current_vertcies_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VMA_MEMORY_USAGE_GPU_TO_CPU);
-	    //아마 잠깐이긴 하지만 CPU TO GPU방식을 쓸것이다.
-	    chunkSystem._meshBuffers[i].indexBuffer = create_buffer(sizeof(uint32_t) * current_indices_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VMA_MEMORY_USAGE_GPU_TO_CPU);
-
-	    //indirectBuffer 만들기(아주 작은 indirectBuffer 20바이트 짜리를 만든다)
-	    chunkSystem._meshBuffers[i].indirectCmdBuffer = create_buffer(sizeof(VkDrawIndexedIndirectCommand) * chunkSystem.indirect_buffer_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
-
-	    chunkSystem._meshBuffers[i].globalOffsetBuffer = create_buffer(sizeof(uint64_t),VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VMA_MEMORY_USAGE_GPU_TO_CPU);
-
-
-	    chunkSystem._meshBuffers[i].indirectRangeBuffer = create_buffer(sizeof(VkAccelerationStructureBuildRangeInfoKHR), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, VMA_MEMORY_USAGE_GPU_ONLY);
-
-	    // Deletion Queue
-	    compute_address_helper(&chunkSystem._meshBuffers[1]);
-	    maxIndicies = 2 * maxIndicies;
-
-	    _mainDeletionQueue.push_function([this, i](){
-		destroy_buffer(chunkSystem._meshBuffers[i].indexBuffer);
-		destroy_buffer(chunkSystem._meshBuffers[i].indirectCmdBuffer);
-		destroy_buffer(chunkSystem._meshBuffers[i].vertexBuffer);
-		destroy_buffer(chunkSystem._meshBuffers[i].globalOffsetBuffer);
-		destroy_buffer(chunkSystem._meshBuffers[i].indirectRangeBuffer);
-	    });
-	    return;
-	}
-    }
 }
 void VulkanEngine::compute_address_helper(GPUMeshBuffers* meshBuffer){
     VkBufferDeviceAddressInfo addrInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
@@ -1424,15 +1371,8 @@ void VulkanEngine::compute_address_helper(GPUMeshBuffers* meshBuffer){
     addrInfo.buffer = meshBuffer->vertexBuffer.buffer;
     meshBuffer->vertexBufferAddress = vkGetBufferDeviceAddress(_device, &addrInfo);
 
-    addrInfo.buffer = meshBuffer->indexBuffer.buffer;
-    //이제 여기에 너에 Index buffer의 addr이 있을것이다
-    meshBuffer->indexBufferAddress = vkGetBufferDeviceAddress(_device, &addrInfo);
-
-    addrInfo.buffer = meshBuffer->indirectCmdBuffer.buffer;
-    meshBuffer->indirectCmdBufferAddress = vkGetBufferDeviceAddress(_device, &addrInfo);
-
-    addrInfo.buffer = meshBuffer->globalOffsetBuffer.buffer;
-    meshBuffer->globalOffsetBufferAddress = vkGetBufferDeviceAddress(_device, &addrInfo);
+    addrInfo.buffer = meshBuffer->chunkMetaBuffer.buffer;
+    meshBuffer->chunkMetaBufferAddress = vkGetBufferDeviceAddress(_device, &addrInfo);
 
     addrInfo.buffer = meshBuffer->indirectRangeBuffer.buffer;
     meshBuffer->indirectRangeBufferAddress = vkGetBufferDeviceAddress(_device, &addrInfo);
@@ -1576,6 +1516,8 @@ void VulkanEngine::draw_geomatry(VkCommandBuffer cmd){
     }
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _graphicsPipelineLayout, 0, 1, &imageSet, 0, nullptr);
 
+    rayTracer.bindDescriptorSet(this, &cmd, &rayTracingBuffer);
+
     PipelineSetter setter;
 
     VkViewport viewport = setter.viewport(_windowExtent.width, _windowExtent.height);
@@ -1587,11 +1529,9 @@ void VulkanEngine::draw_geomatry(VkCommandBuffer cmd){
     DrawMeshBuffer push_constants;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _graphicsPipeline);
     push_constants.worldMatrix = sceneData.proj * sceneData.view;
-    push_constants.outputVertexBuffer = chunkSystem._meshBuffers[chunkSystem._frontBufferIdx].vertexBufferAddress;
+    push_constants.outputVertexBuffer = chunkSystem._meshBuffers.vertexBufferAddress;
     vkCmdPushConstants(cmd, _graphicsPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(DrawMeshBuffer), &push_constants);
-    vkCmdBindIndexBuffer(cmd, chunkSystem._meshBuffers[chunkSystem._frontBufferIdx].indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-    //vkCmdDrawIndexedIndirect(cmd, chunkSystem._meshBuffers[chunkSystem._frontBufferIdx].indirectCmdBuffer.buffer, 0, chunkSystem.indirect_buffer_size, sizeof(VkDrawIndexedIndirectCommand));
-    vkCmdDrawIndexedIndirectCount(cmd, chunkSystem._meshBuffers[chunkSystem._frontBufferIdx].finalIndirectBuffer.buffer, 0, chunkSystem._meshBuffers[chunkSystem._frontBufferIdx].drawCounterBuffer.buffer, 0, chunkSystem.indirect_buffer_size, sizeof(VkDrawIndexedIndirectCommand));
+    vkCmdDrawIndirectCount(cmd, chunkSystem._meshBuffers.finalIndirectBuffer.buffer, 0, chunkSystem._meshBuffers.drawCounterBuffer.buffer, 0, chunkSystem.indirect_buffer_size, sizeof(VkDrawIndirectCommand));
 
     auto draw = [&](const RenderObject& r) {
 	//material이 직전에 그린것하고 다르다??
@@ -1675,19 +1615,17 @@ void VulkanEngine::draw()
     VkCommandBufferBeginInfo cmdBeginInfo = vkinit::command_buffer_begin_info(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
 
     VK_CHECK(vkBeginCommandBuffer(cmd, &cmdBeginInfo));	
-
     //VBO데이터들 설정을 하기
-    chunkSystem.frame_chunk_generation(this, cmd, _voxeldataPipelineLayout, chunkSystem._meshBuffers);
+    chunkSystem.frame_chunk_generation(this, &voxelPipeline ,cmd, &chunkSystem._meshBuffers);
 
     //UBO셋팅 및 값 넣기
     cullComputePipeline.cull_compute_descriptor(this, &cullUniformBuffer, sceneData, &chunkSystem, &_windowExtent);
-    executeCulling.execute_culling(this, &cullUniformBuffer, &chunkSystem, &cullCompute, cmd, &_cullPipelineLayout, chunkSystem._meshBuffers);
+    executeCulling.execute_culling(this, &cullUniformBuffer, &chunkSystem, &cullCompute, cmd, &_cullPipelineLayout, &chunkSystem._meshBuffers);
 
     //현제는 transition (undeifned --> layout genral(우리가 쉐이더로 image에다가 원하는걸 쓸 수 있게)
     vkutil::transition_image(cmd, _drawImage.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-
-    //rayTracer.activateRayTacing(this, &cmd, &chunkSystem._meshBuffers[chunkSystem._frontBufferIdx], &rayTracingBuffer, current_vertcies_size);
-
+    
+    rayTracer.activateRayTacing(this, &chunkSystem, &cmd, &chunkSystem._meshBuffers, &rayTracingBuffer);
     //배경을 그려넣는다
     draw_background(cmd);
 
@@ -1696,7 +1634,6 @@ void VulkanEngine::draw()
 
     //draw_geomatry 를 그리기
     draw_geomatry(cmd);
-
     //이제 다 그렸으니 전송 상태에서 대기(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
     vkutil::transition_image(cmd, _drawImage.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
@@ -1710,7 +1647,7 @@ void VulkanEngine::draw()
     vkutil::transition_image(cmd, _swapchainImages[swapchainImageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
     //이제 UI (IMGUI)를 추가로 그릴거임
-    draw_imgui(cmd,  _swapchainImageViews[swapchainImageIndex]);
+    draw_imgui(cmd, _swapchainImageViews[swapchainImageIndex]);
 
     // 이제 layout을 present mode로 바꾸면 끝이다
     vkutil::transition_image(cmd, _swapchainImages[swapchainImageIndex], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);

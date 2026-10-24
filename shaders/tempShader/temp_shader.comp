@@ -9,51 +9,69 @@ struct Vertex {
     vec4 color;
 };
 
-struct DrawIndexedIndirectCommand {
-    uint indexCount;
-    uint instanceCount;
-    uint firstIndex;
-    int  vertexOffset;
-    uint firstInstance;
+struct DrawIndirectCommand {
+    uint vertexCount;   
+    uint instanceCount; 
+    uint firstVertex;   
+    uint firstInstance; 
 };
 
-struct ASBuildRangeInfo {
-    uint primitiveCount;   
-    uint primitiveOffset;  
-    uint firstVertex;      
+//this is going to be used later
+struct VkAccelerationStructureBuildRangeInfoKHR {
+    uint primitiveCount;
+    uint primitiveOffset;
+    uint firstVertex;
     uint transformOffset;
 };
 
-struct ChunkMetadata {
-    vec4                       aabbMin;
-    vec4                       aabbMax;
-    DrawIndexedIndirectCommand drawCmd;    
-    ASBuildRangeInfo           blasRange;  
-    uint                       chunkID;
-    uint                       flags;      
-    uint                       _pad[2];
+struct PerlinNoiseData {
+    float amplitude;
+    float frequency;
+    float persistence;
+    float lacunarity;
+    uint  octave;
 };
+const PerlinNoiseData noiseData = PerlinNoiseData(300.0f, 0.005f, 0.5f, 2.0f, 7u);
+
+struct ChunkMetadata {
+    DrawIndirectCommand drawCmd;    
+    vec4 aabbMin;
+    vec4 aabbMax;
+    uint chunkID;
+    uint flags;      
+    uint _pad[2];
+};
+
 
 struct MCData { ivec4 triRows[4]; };
 struct GRIDCELL { vec3 p[8]; float val[8]; };
-struct TRIANGLE { vec3 position[3]; vec4 color[3]; };
+struct TRIANGLE { vec3 position[3]; };
 struct SingleVoxel { TRIANGLE triangle[5]; uint ntriang; };
 
-layout(buffer_reference, std430) buffer VertexBufferRef { Vertex vertices[]; };
-layout(buffer_reference, std430) buffer IndexBufferRef  { uint indices[]; };
-layout(buffer_reference, std430) readonly buffer ChunkMetadataBufferRef { ChunkMetadata chunkData[]; };
+layout(buffer_reference, std430) buffer VertexBufferRef {
+    Vertex vertices[];
+};
+
+layout(buffer_reference, std430) buffer ChunkMetadataBufferRef { 
+    ChunkMetadata chunkData[]; 
+};
+
+layout(buffer_reference, std430) writeonly buffer RangeBufferRef {
+    VkAccelerationStructureBuildRangeInfoKHR ranges[];
+};
 
 layout(std140, set = 0, binding = 0) uniform MCUniformBuffer {
-    ivec4  edgeTable[64];
+    ivec4 edgeTable[64];
     MCData triTable[256];
 } u_mcTables;
 
 layout(push_constant) uniform PushConstants {
-    VertexBufferRef        outputVertexBuffer;
-    IndexBufferRef         outputIndexBuffer;  
-    ChunkMetadataBufferRef chunkMetadataBuffer; 
-    vec4                   inputStartPosition;  
-    uvec4                  chunkGridDim;        // 💡 3D 청크 차원 (x, y, z)
+    VertexBufferRef  outputVertexBuffer;
+    ChunkMetadataBufferRef chunkMetadataBuffer;
+    RangeBufferRef rangeBuffer;
+    uint pad[2];
+    vec4 inputStartPosition;  
+    uvec4 chunkGridDim;
 } push;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
@@ -62,13 +80,17 @@ shared uint groupWorkgroupOffset;
 shared uint groupBaseVertexIndex;
 
 int getTriTableValue(uint cubeIndex, int i) {
-    return u_mcTables.triTable[cubeIndex].triRows[i / 4][i % 4];
+    int row = i / 4;
+    int col = i % 4;
+    return u_mcTables.triTable[cubeIndex].triRows[row][col];
 }
 
 int getEdgeFlags(uint cubeIndex) {
-    return u_mcTables.edgeTable[int(cubeIndex) / 4][int(cubeIndex) % 4];
+    int row = int(cubeIndex) / 4;
+    int col = int(cubeIndex) % 4;
+    return u_mcTables.edgeTable[row][col];
 }
-
+//이것은 각각 voxel에서 triangle갯수들이다 ㅇㅇ
 int getTriCount(uint cubeIndex) {
     int count = 0;
     for (int i = 0; i < 16; i += 3) {
@@ -82,7 +104,9 @@ vec2 randomGradiantVector(vec2 gridEdge) {
     gridEdge += 0.01;
     float randomVectorX = dot(gridEdge, vec2(123.4, 234.5));
     float randomVectorY = dot(gridEdge, vec2(234.5, 345.6));
-    return sin(vec2(randomVectorX, randomVectorY));
+    vec2 gradient = vec2(randomVectorX, randomVectorY);
+    gradient = sin(gradient);
+    return gradient;
 }
 
 float perlin_noise(float noiseX, float noiseZ) {
@@ -90,31 +114,46 @@ float perlin_noise(float noiseX, float noiseZ) {
     vec2 gridID = floor(amoutOfChunk);
     vec2 gridSpecification = fract(amoutOfChunk);
 
-    vec2 bottomLeft  = gridID + vec2(0.0f, 0.0f);
+    vec2 bottomLeft = gridID + vec2(0.0f, 0.0f);
     vec2 bottomRight = gridID + vec2(1.0f, 0.0f);
-    vec2 topLeft     = gridID + vec2(0.0f, 1.0f);
-    vec2 topRight    = gridID + vec2(1.0f, 1.0f);
+    vec2 topLeft = gridID + vec2(0.0f, 1.0f);
+    vec2 topRight = gridID + vec2(1.0f, 1.0f);
 
-    float dotBottomLeft  = dot(randomGradiantVector(bottomLeft),  gridSpecification - vec2(0.0f, 0.0f));
-    float dotBottomRight = dot(randomGradiantVector(bottomRight), gridSpecification - vec2(1.0f, 0.0f));
-    float dotTopLeft     = dot(randomGradiantVector(topLeft),     gridSpecification - vec2(0.0f, 1.0f));
-    float dotTopRight    = dot(randomGradiantVector(topRight),    gridSpecification - vec2(1.0f, 1.0f));
+    vec2 randomGradientBottomLeft = randomGradiantVector(bottomLeft);
+    vec2 randomGradientBottomRight = randomGradiantVector(bottomRight);
+    vec2 randomGradientTopLeft = randomGradiantVector(topLeft);
+    vec2 randomGradientTopRight = randomGradiantVector(topRight);
+
+    vec2 distanceFromPixelBottomLeft = gridSpecification - vec2(0.0f, 0.0f);
+    vec2 distanceFromPixelBottomRight = gridSpecification - vec2(1.0f, 0.0f);
+    vec2 distanceFromPixelTopLeft = gridSpecification - vec2(0.0f, 1.0f);
+    vec2 distanceFromPixelTopRight = gridSpecification - vec2(1.0f, 1.0f);
+
+    float dotBottomLeft = dot(randomGradientBottomLeft, distanceFromPixelBottomLeft);
+    float dotBottomRight = dot(randomGradientBottomRight, distanceFromPixelBottomRight);
+    float dotTopLeft = dot(randomGradientTopLeft, distanceFromPixelTopLeft);
+    float dotTopRight = dot(randomGradientTopRight, distanceFromPixelTopRight);
 
     vec2 f = gridSpecification * gridSpecification * (vec2(3.0f) - vec2(2.0f) * gridSpecification);
+
     float bottom = mix(dotBottomLeft, dotBottomRight, f.x);
     float top    = mix(dotTopLeft,    dotTopRight,    f.x);
-    return mix(bottom, top, f.y);
+    float perlin = mix(bottom, top, f.y);
+    return perlin;
 }
 
 vec3 VertexInterp(float isolevel, vec3 p1, vec3 p2, float valp1, float valp2) {
     if (abs(isolevel - valp1) < 0.00001) return p1;
     if (abs(isolevel - valp2) < 0.00001) return p2;
     float denominator = valp2 - valp1;
-    if (abs(denominator) < 0.00001) return (p1 + p2) * 0.5f;
-    return mix(p1, p2, float((isolevel - valp1) / denominator));
+    if (abs(denominator) < 0.00001) {
+        return (p1 + p2) * 0.5f;
+    }
+    float mu = float((isolevel - valp1) / denominator);
+    return mix(p1, p2, mu);
 }
 
-SingleVoxel marching_cube_calculation(GRIDCELL grid, vec4 color) {
+SingleVoxel marching_cube_calculation(GRIDCELL grid) {
     uint cubeindex = 0;
     uint ntriang = 0;
     vec3 vertlist[12];
@@ -128,8 +167,7 @@ SingleVoxel marching_cube_calculation(GRIDCELL grid, vec4 color) {
     }
     uint edgeFlags = uint(getEdgeFlags(cubeindex));
 
-    // 💡 1. 빈 return 에러 수정: 빈 SingleVoxel 반환
-    if (edgeFlags == 0u)
+    if (edgeFlags == 0)
         return SingleVoxel(triangles, 0u);
 
     if ((edgeFlags & 1u) != 0u)    vertlist[0] = VertexInterp(isolevel, grid.p[0], grid.p[1], grid.val[0], grid.val[1]);
@@ -150,45 +188,42 @@ SingleVoxel marching_cube_calculation(GRIDCELL grid, vec4 color) {
         triangles[ntriang].position[1] = vertlist[getTriTableValue(cubeindex, i+1)];
         triangles[ntriang].position[2] = vertlist[getTriTableValue(cubeindex, i+2)];
 
-        triangles[ntriang].color[0] = color;
-        triangles[ntriang].color[1] = color;
-        triangles[ntriang].color[2] = color;
+        //triangles[ntriang].indicies[0] = i;
+        //triangles[ntriang].indicies[1] = i + 1;
+        //triangles[ntriang].indicies[2] = i + 2;
         ntriang += 1u;
     }
-
     return SingleVoxel(triangles, ntriang);
 }
-
 SingleVoxel evaluate_voxel(vec3 starting_point, vec3 id) {
-    float STEP = 1.0f;
+    float STEP = 1.0f; 
     vec3 UNIT_CUBE_OFFSETS[8] = {
-        {0,0,0}, {1,0,0}, {1,0,1}, {0,0,1},
-        {0,1,0}, {1,1,0}, {1,1,1}, {0,1,1}
+	{0,0,0}, {1,0,0}, {1,0,1}, {0,0,1},
+	{0,1,0}, {1,1,0}, {1,1,1}, {0,1,1}
     };
 
     vec3 cellMinPos = starting_point + (id * STEP);
     GRIDCELL gridcell;
-    vec4 color = vec4(0.4, 0.8, 0.4, 1.0); // 기본 지형 색상
-
     for(int i = 0; i < 8; i++) {
         gridcell.p[i] = cellMinPos + (UNIT_CUBE_OFFSETS[i] * STEP);
         vec3 pos = gridcell.p[i];
         float total_noise = 0.0;
-        float current_amp = 300.0f;
-        float current_freq = 0.005f;
-
-        for (int j = 0; j < 7; j++) {
+        float current_amp = noiseData.amplitude;
+        float current_freq = noiseData.frequency;
+	//전체 크기를 줌 아마 amplitude가 80이고 ocatve가 5면 -155~155의 크기를 총 줄거임
+        for (int j = 0; j < noiseData.octave; j++) {
             float surface = perlin_noise(pos.x * current_freq, pos.z * current_freq);
+	    //j = 0이면 대충 amplitude 가 80이라고 하면 크기는 noise에 따라서 크기를 줄것이다.
             total_noise += surface * current_amp;
-            current_amp *= 0.5f;
-            current_freq *= 2.0f;
+            current_amp *= noiseData.persistence;
+            current_freq *= noiseData.lacunarity;
         }
         gridcell.val[i] = total_noise - pos.y;
     }
-    return marching_cube_calculation(gridcell, color);
+    return marching_cube_calculation(gridcell);
 }
-
-// 💡 스레드별 정점 개수만 빠르게 미리 계산하는 함수 (메모리 사용량 0)
+//cube하나당 미리 빠르게 일단은 세기
+//일단 voxel_count.comp하고 똑같은걸 씀
 uint count_single_voxel(vec3 starting_point, vec3 id) {
     float STEP = 1.0f;
     vec3 cellMinPos = starting_point + (id * STEP);
@@ -196,17 +231,16 @@ uint count_single_voxel(vec3 starting_point, vec3 id) {
         {0,0,0}, {1,0,0}, {1,0,1}, {0,0,1},
         {0,1,0}, {1,1,0}, {1,1,1}, {0,1,1}
     };
-
     uint cubeindex = 0u;
     for(int i = 0; i < 8; i++) {
         vec3 pos = cellMinPos + (UNIT_CUBE_OFFSETS[i] * STEP);
         float total_noise = 0.0;
-        float current_amp = 300.0f;
-        float current_freq = 0.005f;
+        float current_amp = noiseData.amplitude;
+        float current_freq = noiseData.frequency;
         for (int j = 0; j < 7; j++) {
             total_noise += perlin_noise(pos.x * current_freq, pos.z * current_freq) * current_amp;
-            current_amp *= 0.5f;
-            current_freq *= 2.0f;
+            current_amp *= noiseData.persistence;
+            current_freq *= noiseData.lacunarity;
         }
         if ((total_noise - pos.y) < 0.0) cubeindex |= (1u << i);
     }
@@ -214,29 +248,49 @@ uint count_single_voxel(vec3 starting_point, vec3 id) {
     return uint(getTriCount(cubeindex));
 }
 
-void main() {
-    uvec3 local_id = gl_LocalInvocationID;
-    
-    // 💡 3D 청크 인덱스 평탄화
-    uint chunkID = gl_WorkGroupID.x + 
-                   gl_WorkGroupID.y * push.chunkGridDim.x + 
-                   gl_WorkGroupID.z * (push.chunkGridDim.x * push.chunkGridDim.y);
+ivec3 mod3D(ivec3 v, ivec3 m) {
+    return ((v % m) + m) % m;
+}
+// GLSL 내부: 음수 정수 언더플로우를 완벽 차단하는 모듈러
+ivec3 safeMod3D(ivec3 coord, ivec3 dim) {
+    // vec3 float으로 변환 후 floor를 사용하면 음수에서도 -1 -> dim - 1 로 완벽하게 래핑됨
+    vec3 c = vec3(coord);
+    vec3 d = vec3(dim);
+    return ivec3(c - d * floor(c / d));
+}
 
+void main() {
+    //현제 threadID
+    uvec3 local_id = gl_LocalInvocationID;
+    //일단 각각 chunk들의 ID
+    ivec3 minChunkCoord   = ivec3(floor(push.inputStartPosition.xyz / 32.0));
+    ivec3 worldChunkCoord = minChunkCoord + ivec3(gl_WorkGroupID);
+    ivec3 slot3D          = safeMod3D(worldChunkCoord, ivec3(push.chunkGridDim.xyz));
+    vec3 starting_point   = vec3(worldChunkCoord) * 32.0f;
+    uint chunkID = slot3D.x + slot3D.y * push.chunkGridDim.x + slot3D.z * (push.chunkGridDim.x * push.chunkGridDim.y);
+    //uint chunkID = gl_WorkGroupID.x + gl_WorkGroupID.y * push.chunkGridDim.x + gl_WorkGroupID.z * (push.chunkGridDim.x * push.chunkGridDim.y);
+
+    //만약 vertexCount가 0이면 바로 exit
+    if (push.chunkMetadataBuffer.chunkData[chunkID].drawCmd.vertexCount == 0u || 
+	(push.chunkMetadataBuffer.chunkData[chunkID].flags & 2u) == 0u) {
+	return;
+    }
+
+    // 워크그룹 공용 데이터 초기화 및 고정 firstVertex 슬롯 로드
     if (gl_LocalInvocationIndex == 0u) {
         groupWorkgroupOffset = 0u;
-        // 💡 Prefix Sum이 계산해 둔 청크 전용 VRAM 시작 위치 읽기 (글로벌 원자적 연산 없음!)
-        groupBaseVertexIndex = push.chunkMetadataBuffer.chunkData[chunkID].drawCmd.firstIndex;
+        groupBaseVertexIndex = push.chunkMetadataBuffer.chunkData[chunkID].drawCmd.firstVertex;
+
+	uint actualVertices = push.chunkMetadataBuffer.chunkData[chunkID].drawCmd.vertexCount;
+        push.rangeBuffer.ranges[chunkID].primitiveCount  = actualVertices / 3u;
+        push.rangeBuffer.ranges[chunkID].primitiveOffset = 0u;
+        push.rangeBuffer.ranges[chunkID].firstVertex     = 0u;
+        push.rangeBuffer.ranges[chunkID].transformOffset = 0u;
     }
-    barrier();
+    barrier(); 
+    //chunk스타팅 포지셩
 
-    // 청크 자체가 빈 경우(인스턴스 카운트 0) 즉시 조기 탈출
-    if (push.chunkMetadataBuffer.chunkData[chunkID].drawCmd.instanceCount == 0u) {
-        return;
-    }
-
-    vec3 starting_point = (vec3(gl_WorkGroupID) * 32.0f) + push.inputStartPosition.xyz;
-
-    // 💡 1단계: 스레드가 기록할 총 정점 수 계산 (SingleVoxel 배열 저장 X)
+    //일단은 청크 하나의 모든 indicies갯수를 저장을 한다 aka 정점의 갯수들
     uint threadTotalIndices = 0u;
     for (uint x = 0u; x < 4u; x++) {
         for (uint y = 0u; y < 4u; y++) {
@@ -247,15 +301,18 @@ void main() {
         }
     }
 
-    // 💡 2단계: 워크그룹 내 스레드 로컬 오프셋 확보
     uint myLocalOffset = 0u;
     if (threadTotalIndices > 0u) {
         myLocalOffset = atomicAdd(groupWorkgroupOffset, threadTotalIndices);
     }
     barrier();
 
-    // 💡 3단계: 복셀을 즉시 계산하면서 VRAM에 다이렉트 스트리밍 쓰기
     if (threadTotalIndices > 0u) {
+	if(push.chunkMetadataBuffer.chunkData[chunkID].drawCmd.vertexCount <= 0){
+	    return;
+	}
+	//실제 청크 offset + threadOffset
+	//threadOffset는 4*4*4 씩 떨어져서 계산을 함
         uint vertexWriteIdx = groupBaseVertexIndex + myLocalOffset;
 
         for (uint x = 0u; x < 4u; x++) {
@@ -263,26 +320,27 @@ void main() {
                 for (uint z = 0u; z < 4u; z++) {
                     uvec3 voxel_id = (local_id * 4u) + uvec3(x, y, z);
                     SingleVoxel vox = evaluate_voxel(starting_point, vec3(voxel_id));
-
                     for (uint i = 0u; i < vox.ntriang; i++) {
                         // 삼각형 면의 노멀 계산
-                        vec3 edgeA = vox.triangle[i].position[1] - vox.triangle[i].position[0];
-                        vec3 edgeB = vox.triangle[i].position[2] - vox.triangle[i].position[0];
-                        vec3 triNormal = normalize(cross(edgeA, edgeB));
+                        //vec3 edgeA = vox.triangle[i].position[1] - vox.triangle[i].position[0];
+                        //vec3 edgeB = vox.triangle[i].position[2] - vox.triangle[i].position[0];
+			//vec3 crossVal = cross(edgeA, edgeB);
+                        //float lenSq = dot(crossVal, crossVal);
+                        //vec3 triNormal = normalize(cross(edgeA, edgeB));
 
                         for (uint k = 0u; k < 3u; k++) {
                             push.outputVertexBuffer.vertices[vertexWriteIdx].position = vox.triangle[i].position[k];
-                            push.outputVertexBuffer.vertices[vertexWriteIdx].normal   = triNormal;
-                            push.outputVertexBuffer.vertices[vertexWriteIdx].uv_x     = 0.0f;
-                            push.outputVertexBuffer.vertices[vertexWriteIdx].uv_y     = 0.0f;
-                            push.outputVertexBuffer.vertices[vertexWriteIdx].color    = vox.triangle[i].color[k];
-
-                            push.outputIndexBuffer.indices[vertexWriteIdx] = vertexWriteIdx;
+                            //push.outputVertexBuffer.vertices[vertexWriteIdx].normal   = triNormal;
                             vertexWriteIdx++;
                         }
                     }
                 }
             }
         }
+    }
+    barrier();
+    //Dirty한 chunk만 갱신
+    if (gl_LocalInvocationIndex == 0u) {
+        push.chunkMetadataBuffer.chunkData[chunkID].flags &= ~2u; // DIRTY 비트(bit 1)만 클리어
     }
 }

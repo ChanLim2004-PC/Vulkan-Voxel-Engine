@@ -73,6 +73,8 @@ add_executable(${PROJECT_NAME}
     ./src/meshes/voxel/mc_alogo_data.cpp
     ./src/meshes/voxel/chunk.cpp
     ./src/meshes/culling.cpp
+    ./src/engine/pipelines/prefix_pipeline.cpp
+    ./src/engine/pipelines/voxel_count_pipeline.cpp
     ./src/raytracing/acceleration_structure.cpp
 )
 

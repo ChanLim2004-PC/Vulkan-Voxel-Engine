@@ -1,9 +1,10 @@
-#version 450
+#version 460
 //버퍼들을 다룰때 쓰는 extension
 #extension GL_EXT_buffer_reference : require
 
 layout (location = 0) out vec3 outColor;
 layout (location = 1) out vec3 outPosition;
+layout (location = 2) out vec3 outNormal;
 
 //uniform Buffer for our 
 layout(set = 1, binding = 3) uniform VoxelModel{
@@ -21,7 +22,6 @@ layout(std140, set = 3, binding = 0) uniform SceneDataBuffer {
 
 
 //set4 --> generalUniform
-
 struct Vertex {
 	vec3 position;
 	float uv_x;
@@ -53,6 +53,8 @@ void main()
     gl_Position = PushConstants.render_matrix * voxelModel.singleTileModel * vec4(v.position, 1.0f);
     //이것은 나중에 너가 지우삼
     gl_Position = sceneDataBuffer.viewProj * worldPosition;
+
     outColor = v.color.xyz;
     outPosition = worldPosition.xyz;
+    outNormal = v.normal.xyz;
 }

@@ -4,31 +4,21 @@
 #include <cstdint>
 
 void CullComputePipeline::culling_create_buffer(VulkanEngine* engine, ChunkSystem* chunkSystem){
-    //becuase it is double buffering
-    for (int i = 0; i < 2; ++i) {
-	//counter buffer creation
-	chunkSystem->_meshBuffers[i].drawCounterBuffer = engine->create_buffer(sizeof(uint64_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_2_INDIRECT_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_TO_CPU);
-	VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
-	addressInfo.buffer = chunkSystem->_meshBuffers[i].drawCounterBuffer.buffer;
-	chunkSystem->_meshBuffers[i].drawCounterBufferAddress = vkGetBufferDeviceAddress(engine->_device, &addressInfo);
+    //counter buffer creation
+    chunkSystem->_meshBuffers.drawCounterBuffer = engine->create_buffer(sizeof(uint64_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_2_INDIRECT_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_TO_CPU);
+    VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+    addressInfo.buffer = chunkSystem->_meshBuffers.drawCounterBuffer.buffer;
+    chunkSystem->_meshBuffers.drawCounterBufferAddress = vkGetBufferDeviceAddress(engine->_device, &addressInfo);
 
-	//batchoffset buffer
-	float dataSize = chunkSystem->indirect_buffer_size * sizeof(glm::vec4);
-	chunkSystem->_meshBuffers[i].batchOffsetBuffer = engine->create_buffer(dataSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
-	addressInfo.buffer = chunkSystem->_meshBuffers[i].batchOffsetBuffer.buffer;
-	chunkSystem->_meshBuffers[i].batchOffsetBufferAddress = vkGetBufferDeviceAddress(engine->_device, &addressInfo);
+    //finalIndirect buffer
+    chunkSystem->_meshBuffers.finalIndirectBuffer = engine->create_buffer(sizeof(VkDrawIndirectCommand) * chunkSystem->indirect_buffer_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_2_INDIRECT_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+    addressInfo.buffer = chunkSystem->_meshBuffers.finalIndirectBuffer.buffer;
+    chunkSystem->_meshBuffers.finalIndirectBufferAddress = vkGetBufferDeviceAddress(engine->_device, &addressInfo);
 
-	//finalIndirect buffer
-	chunkSystem->_meshBuffers[i].finalIndirectBuffer = engine->create_buffer(sizeof(VkDrawIndexedIndirectCommand) * chunkSystem->indirect_buffer_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_2_INDIRECT_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_TO_CPU);
-	addressInfo.buffer = chunkSystem->_meshBuffers[i].finalIndirectBuffer.buffer;
-	chunkSystem->_meshBuffers[i].finalIndirectBufferAddress = vkGetBufferDeviceAddress(engine->_device, &addressInfo);
-
-	engine->_mainDeletionQueue.push_function([=](){
-	    engine->destroy_buffer(chunkSystem->_meshBuffers[i].batchOffsetBuffer);
-	    engine->destroy_buffer(chunkSystem->_meshBuffers[i].drawCounterBuffer);
-	    engine->destroy_buffer(chunkSystem->_meshBuffers[i].finalIndirectBuffer);
-	});
-    }
+    engine->_mainDeletionQueue.push_function([=](){
+	engine->destroy_buffer(chunkSystem->_meshBuffers.drawCounterBuffer);
+	engine->destroy_buffer(chunkSystem->_meshBuffers.finalIndirectBuffer);
+    });
 }
 
 GPUCullData CullComputePipeline::cull_unifrom_data(GPUSceneData sceneData, ChunkSystem* chunkSystem, VkExtent2D* _windowExtent){
@@ -47,8 +37,8 @@ GPUCullData CullComputePipeline::cull_unifrom_data(GPUSceneData sceneData, Chunk
 
     uniformData.znear = 0.01f;
     uniformData.zfar = 1000.0f;           
-    uniformData.drawCount = chunkSystem->indirect_buffer_size;          
-    uniformData.cullingEnabled = 1;      
+    //uniformData.drawCount = chunkSystem->indirect_buffer_size;          
+    uniformData.cullingEnabled = 0;      
     uniformData.occlusionEnabled = 0;    
     uniformData.lodEnabled = 0;         
     uniformData.pyramidWidth = 0;          
